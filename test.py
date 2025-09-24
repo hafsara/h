@@ -67,3 +67,60 @@ def update_application(app_id):
     except SQLAlchemyError as e:
         db.session.rollback()
         return error_response("Database update failed: " + str(e), 500)
+
+
+DEFAULT_EMAIL_TEMPLATES = [
+    {
+        "template_type": "reminder",
+        "subject": "Reminder for <:title:>",
+        "body": (
+            "Hello <:user_email:>,<br><br>"
+            "You have a pending form to complete:<br>"
+            "<:form_link=Click here:><br><br>"
+            "Current workflow step: <:wrk_step:><br>"
+            "<:style:color=#047857; font-weight=bold:>This is important!</:style:>"
+        ),
+        "signature": "The <:style:font-style=italic:>Automation Team</:style:>"
+    },
+    {
+        "template_type": "escalate",
+        "subject": "Escalation Notice for <:title:>",
+        "body": (
+            "Dear <:@MANAGER:>,<br><br>"
+            "The form '<:title:>' is overdue.<br>"
+            "User responsible: <:user_email:><br>"
+            "Please review at: <:form_link=Review Now:>"
+        ),
+        "signature": "PSIRT: <:@PSIRT:>"
+    },
+    {
+        "template_type": "user_notification",
+        "subject": "We received your form <:title:>",
+        "body": (
+            "Hello <:user_email:>,<br><br>"
+            "Your form submission '<:title:>' has been received.<br>"
+            "Description:<br>"
+            "<:style:font-style=italic; color=gray:><:description:></:style:>"
+        ),
+        "signature": "Support Team"
+    }
+]
+
+
+
+
+
+NOTIFICATION_EMAIL_TEMPLATE = {
+    "template_type": "user_notification",
+    "subject": "New Form Assigned: <:title:>",
+    "body": (
+        "Hello <:user_email:>,<br><br>"
+        "You have been assigned a new form: <:title:><br><br>"
+        "Description: <:description:><br><br>"
+        "Please complete it as soon as possible using the link below:<br>"
+        "<:form_link=Fill the Form:><br><br>"
+        "Thank you,<br>"
+        "The Workflow Automation Team"
+    ),
+    "signature": "Support"
+}
