@@ -1,0 +1,108 @@
+
+import { Component, OnInit } from '@angular/core';
+import { FormService } from '../../services/form.service';
+import { TokenService } from '../../services/token.service';
+import { MessageService } from 'primeng/api';
+import { Router } from '@angular/router';
+
+export interface TokenEntry {
+  value: string;
+  status: 'pending' | 'valid' | 'invalid';
+  errorMessage?: string;
+}
+
+@Component({
+  selector: 'app-access-control',
+  templateUrl: './access-control.component.html',
+  styleUrls: ['./access-control.component.scss'],
+  providers: [MessageService]
+})
+export class AccessControlComponent implements OnInit {
+  tokens: TokenEntry[] = [];
+  isLoading = true;
+  isSubmitting = false;
+
+  constructor(
+    private formService: FormService,
+    private tokenService: TokenService,
+    private messageService: MessageService,
+    private router: Router
+  ) {}
+
+  ngOnInit(): void {
+    this.tokenService.loadingStatus.subscribe((isLoading) => {
+      this.isLoading = isLoading;
+      if (!isLoading && this.tokenService.hasValidTokens()) {
+        this.router.navigate(['/dashboard']);
+      }
+    });
+  }
+
+  get tokenValues(): string[] {
+    return this.tokens.map(t => t.value);
+  }
+
+  onTokenAdd(event: any): void {
+    const newToken: TokenEntry = { value: event.value, status: 'pending' };
+    this.tokens.push(newToken);
+    this.validateToken(newToken);
+  }
+
+  onTokenRemove(event: any): void {
+    this.tokens = this.tokens.filter(t => t.value !== event.value);
+  }
+
+  validateToken(token: TokenEntry): void {
+    token.status = 'pending';
+    this.formService.validateToken(token.value).subscribe({
+      next: (response) => {
+        if (response.is_valid) {
+          token.status = 'valid';
+          token.errorMessage = undefined;
+        } else {
+          token.status = 'invalid';
+          token.errorMessage = `Token ${token.value} is invalid.`;
+          this.messageService.add({
+            severity: 'error',
+            summary: 'Invalid Token',
+            detail: token.errorMessage
+          });
+        }
+      },
+      error: () => {
+        token.status = 'invalid';
+        token.errorMessage = `Error validating token ${token.value}`;
+        this.messageService.add({
+          severity: 'error',
+          summary: 'Validation Error',
+          detail: token.errorMessage
+        });
+      }
+    });
+  }
+
+  canSubmit(): boolean {
+    return this.tokens.length > 0 && this.tokens.every(t => t.status === 'valid');
+  }
+
+  submitTokens(): void {
+    if (!this.canSubmit()) {
+      this.messageService.add({
+        severity: 'warn',
+        summary: 'Invalid',
+        detail: 'Please provide only valid tokens.'
+      });
+      return;
+    }
+
+    this.isSubmitting = true;
+    const validValues = this.tokens.map(t => t.value);
+
+    this.tokenService.storeTokens(validValues, 60);
+    this.formService.logConnection({ app_ids: validValues });
+
+    this.router.navigate(['/dashboard']).finally(() => {
+      this.isSubmitting = false;
+    });
+  }
+}

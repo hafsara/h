@@ -1,126 +1,67 @@
-def update_application(app_id):
-    """
-    Update an application's name, token (if required), and mail sender.
-    """
-    data = request.json
+<p-toast></p-toast>
 
-    try:
-        validated_data = application_update_schema.load(data)
-    except ValidationError as err:
-        return error_response(err.messages, 400)
+<div *ngIf="isLoading; else accessForm" class="spinner-container">
+  <p-progressSpinner ariaLabel="loading"></p-progressSpinner>
+</div>
 
-    application = Application.query.filter_by(id=app_id).first_or_404()
-    old_app_id = application.id
-    old_name = application.name
-    generate_new_id = validated_data.get("generate_new_id", False)
+<ng-template #accessForm>
+  <app-default-navbar *ngIf="!isLoading"></app-default-navbar>
 
-    try:
-        if "name" in validated_data and validated_data["name"] != application.name:
-            new_name = validated_data["name"]
-            existing_app = Application.query.filter_by(name=new_name).first()
-            if existing_app and existing_app.id != application.id:
-                return error_response("Application name already exists", 400)
+  <div class="page-background">
+    <div class="card-wrapper">
+      <p-card class="access-card">
+        <h2>Enter Applications ID</h2>
 
-        db.session.begin_nested()
+        <p-chips
+          [ngModel]="tokenValues"
+          (onAdd)="onTokenAdd($event)"
+          (onRemove)="onTokenRemove($event)"
+          (keydown.enter)="$event.preventDefault()"
+          placeholder="Enter tokens"
+          separator=","
+          allowDuplicate="false"
+          class="w-100">
+        </p-chips>
 
-        if "name" in validated_data and validated_data["name"] != application.name:
-            new_name = validated_data["name"]
-            application.name = new_name
+        <!-- Affichage d’erreurs spécifiques -->
+        <div *ngFor="let token of tokens">
+          <small *ngIf="token.status === 'invalid'" class="error-msg">
+            {{ token.errorMessage }}
+          </small>
+        </div>
 
-            # Update app_names in API tokens
-            api_tokens = APIToken.query.filter(APIToken.app_names.contains([old_name])).all()
-            for token in api_tokens:
-                token.app_names = [new_name if name == old_name else name for name in token.app_names]
-            db.session.bulk_save_objects(api_tokens)
-
-        if "new_mail_sender" in validated_data and application.mail_sender != validated_data["new_mail_sender"]:
-            application.mail_sender = validated_data["new_mail_sender"]
-
-        if "exposed" in validated_data:
-            application.exposed = validated_data["exposed"]
-
-        new_app_id = None
-        if generate_new_id:
-            new_app_id = str(uuid.uuid4())
-
-            while Application.query.filter_by(id=new_app_id).first():
-                new_app_id = str(uuid.uuid4())
-            FormContainer.query.filter_by(app_id=old_app_id).update({"app_id": new_app_id})
-            Campaign.query.filter_by(app_id=old_app_id).update({"app_id": new_app_id})
-            EmailTemplate.query.filter_by(app_token=old_app_id).update({"app_token": new_app_id})
-            application.id = new_app_id
-
-        db.session.commit()
-        redis_key_id = new_app_id if generate_new_id else old_app_id
-        if "name" in validated_data or generate_new_id:
-            redis_client.setex(f"app:changed:{redis_key_id}", 60, "modified")
-
-        return jsonify({
-            "message": "Application updated successfully",
-            "app_token": application.id,
-            "new_app_id": new_app_id if generate_new_id else None
-        }), 200
-
-    except IntegrityError as e:
-        db.session.rollback()
-        return error_response("Integrity error: possible duplicate name or ID", 400)
-    except SQLAlchemyError as e:
-        db.session.rollback()
-        return error_response("Database update failed: " + str(e), 500)
-
-
-DEFAULT_EMAIL_TEMPLATES = [
-    {
-        "template_type": "reminder",
-        "subject": "Reminder for <:title:>",
-        "body": (
-            "Hello <:user_email:>,<br><br>"
-            "You have a pending form to complete:<br>"
-            "<:form_link=Click here:><br><br>"
-            "Current workflow step: <:wrk_step:><br>"
-            "<:style:color=#047857; font-weight=bold:>This is important!</:style:>"
-        ),
-        "signature": "The <:style:font-style=italic:>Automation Team</:style:>"
-    },
-    {
-        "template_type": "escalate",
-        "subject": "Escalation Notice for <:title:>",
-        "body": (
-            "Dear <:@MANAGER:>,<br><br>"
-            "The form '<:title:>' is overdue.<br>"
-            "User responsible: <:user_email:><br>"
-            "Please review at: <:form_link=Review Now:>"
-        ),
-        "signature": "PSIRT: <:@PSIRT:>"
-    },
-    {
-        "template_type": "user_notification",
-        "subject": "We received your form <:title:>",
-        "body": (
-            "Hello <:user_email:>,<br><br>"
-            "Your form submission '<:title:>' has been received.<br>"
-            "Description:<br>"
-            "<:style:font-style=italic; color=gray:><:description:></:style:>"
-        ),
-        "signature": "Support Team"
-    }
-]
+        <div class="flex pt-4 justify-content-end">
+          <p-button
+            label="Enter"
+            icon="pi pi-arrow-right"
+            iconPos="right"
+            (onClick)="submitTokens()"
+            [disabled]="!canSubmit()"
+            [loading]="isSubmitting">
+          </p-button>
+        </div>
+      </p-card>
+    </div>
+  </div>
+</ng-template>
 
 
 
 
 
-NOTIFICATION_EMAIL_TEMPLATE = {
-    "template_type": "user_notification",
-    "subject": "New Form Assigned: <:title:>",
-    "body": (
-        "Hello <:user_email:>,<br><br>"
-        "You have been assigned a new form: <:title:><br><br>"
-        "Description: <:description:><br><br>"
-        "Please complete it as soon as possible using the link below:<br>"
-        "<:form_link=Fill the Form:><br><br>"
-        "Thank you,<br>"
-        "The Workflow Automation Team"
-    ),
-    "signature": "Support"
+.p-chips-token {
+  &.valid {
+    background-color: #d4edda !important;
+    color: #155724 !important;
+  }
+  &.invalid {
+    background-color: #f8d7da !important;
+    color: #721c24 !important;
+  }
+}
+
+.error-msg {
+  color: #dc3545;
+  font-size: 0.8rem;
+  margin-left: 5px;
 }
