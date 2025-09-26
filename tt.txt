@@ -1,108 +1,58 @@
+          <ng-template let-value pTemplate="item">
+            <span class="chip" [ngClass]="entryByValue(value)?.status">
+              {{ value }}
+              <i *ngIf="entryByValue(value)?.status === 'valid'"></i>
+              <i *ngIf="entryByValue(value)?.status === 'invalid'"></i>
+              <span *ngIf="entryByValue(value)?.status === 'pending'" class="chip-spinner">
+                <p-progressSpinner [style]="{width:'12px',height:'12px'}" strokeWidth="8"></p-progressSpinner>
+              </span>
+            </span>
+          </ng-template>
 
-import { Component, OnInit } from '@angular/core';
-import { FormService } from '../../services/form.service';
-import { TokenService } from '../../services/token.service';
-import { MessageService } from 'primeng/api';
-import { Router } from '@angular/router';
 
-export interface TokenEntry {
-  value: string;
-  status: 'pending' | 'valid' | 'invalid';
-  errorMessage?: string;
+
+
+  entryByValue(v: string): TokenEntry | undefined {
+    return this.tokens.find(t => t.value === v);
+  }
+
+
+/* 1) Neutraliser le wrapper PrimeNG */
+:host ::ng-deep .p-chips .p-chips-token {
+  background: transparent !important;
 }
 
-@Component({
-  selector: 'app-access-control',
-  templateUrl: './access-control.component.html',
-  styleUrls: ['./access-control.component.scss'],
-  providers: [MessageService]
-})
-export class AccessControlComponent implements OnInit {
-  tokens: TokenEntry[] = [];
-  isLoading = true;
-  isSubmitting = false;
 
-  constructor(
-    private formService: FormService,
-    private tokenService: TokenService,
-    private messageService: MessageService,
-    private router: Router
-  ) {}
+/* 3) Ton chip complet (texte + statut + bouton remove) */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .25rem .5rem .25rem .5rem;
+  border-radius: 999px;
+  font-size: .9rem;
+  line-height: 1;
 
-  ngOnInit(): void {
-    this.tokenService.loadingStatus.subscribe((isLoading) => {
-      this.isLoading = isLoading;
-      if (!isLoading && this.tokenService.hasValidTokens()) {
-        this.router.navigate(['/dashboard']);
-      }
-    });
-  }
-
-  get tokenValues(): string[] {
-    return this.tokens.map(t => t.value);
-  }
-
-  onTokenAdd(event: any): void {
-    const newToken: TokenEntry = { value: event.value, status: 'pending' };
-    this.tokens.push(newToken);
-    this.validateToken(newToken);
-  }
-
-  onTokenRemove(event: any): void {
-    this.tokens = this.tokens.filter(t => t.value !== event.value);
-  }
-
-  validateToken(token: TokenEntry): void {
-    token.status = 'pending';
-    this.formService.validateToken(token.value).subscribe({
-      next: (response) => {
-        if (response.is_valid) {
-          token.status = 'valid';
-          token.errorMessage = undefined;
-        } else {
-          token.status = 'invalid';
-          token.errorMessage = `Token ${token.value} is invalid.`;
-          this.messageService.add({
-            severity: 'error',
-            summary: 'Invalid Token',
-            detail: token.errorMessage
-          });
-        }
-      },
-      error: () => {
-        token.status = 'invalid';
-        token.errorMessage = `Error validating token ${token.value}`;
-        this.messageService.add({
-          severity: 'error',
-          summary: 'Validation Error',
-          detail: token.errorMessage
-        });
-      }
-    });
-  }
-
-  canSubmit(): boolean {
-    return this.tokens.length > 0 && this.tokens.every(t => t.status === 'valid');
-  }
-
-  submitTokens(): void {
-    if (!this.canSubmit()) {
-      this.messageService.add({
-        severity: 'warn',
-        summary: 'Invalid',
-        detail: 'Please provide only valid tokens.'
-      });
-      return;
-    }
-
-    this.isSubmitting = true;
-    const validValues = this.tokens.map(t => t.value);
-
-    this.tokenService.storeTokens(validValues, 60);
-    this.formService.logConnection({ app_ids: validValues });
-
-    this.router.navigate(['/dashboard']).finally(() => {
-      this.isSubmitting = false;
-    });
-  }
+  &.valid   { background-color: #d4edda; color: #155724; }
+  &.invalid { background-color: #f8d7da; color: #721c24; }
+  &.pending { background-color: #e2e3e5; color: #383d41; }
 }
+
+.chip-status { font-size: .8rem; line-height: 1; }
+
+/* 4) Bouton remove intégré dans la pilule */
+.chip-remove {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  opacity: .75;
+}
+.chip-remove:hover { opacity: 1; }
+
+.chip-spinner { display: inline-flex; }
