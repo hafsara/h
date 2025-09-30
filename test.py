@@ -177,3 +177,29 @@ def determine_notification_template(form_container: FormContainer) -> str:
         #         'priority': 5
         #     }
         # }
+::ng-deep .p-inputnumber {
+  max-width: 120px; /* réduit la largeur */
+}
+
+::ng-deep .p-inputnumber .p-inputtext {
+  text-align: center; /* centre le chiffre */
+  padding: 0.25rem 0.5rem; /* réduit le padding */
+  font-size: 14px; /* taille plus fine */
+}
+
+::ng-deep .p-inputnumber .p-button {
+  height: 32px; /* rend les boutons plus petits */
+  width: 32px;
+  padding: 0;
+  border-radius: 6px; /* arrondit un peu les boutons */
+}
+
+::ng-deep .p-inputnumber .p-button.p-button-success {
+  background: #00c853; /* vert plus sympa */
+  border: none;
+}
+
+::ng-deep .p-inputnumber .p-button.p-button-danger {
+  background: #d32f2f; /* rouge plus soft */
+  border: none;
+}
