@@ -1,0 +1,275 @@
+Vous avez tout à fait raison ! Avec OAuth2/OIDC, le callback se fait directement sur l'URL de base (`http://localhost:4200/`). Voici la correction :
+
+## 1. Configuration OAuth2 corrigée
+
+**auth.config.ts**
+import { AuthConfig } from 'angular-oauth2-oidc';
+
+export const authConfig: AuthConfig = {
+  issuer: 'https://your-apigee-domain/oauth2',
+  redirectUri: window.location.origin,
+  clientId: 'your-client-id',
+  scope: 'openid profile email',
+  responseType: 'code',
+  showDebugInformation: true,
+  oidc: true,
+  silentRefreshRedirectUri: window.location.origin + '/silent-refresh.html',
+  useSilentRefresh: false,
+  requireHttps: true
+};
+
+```
+
+## 2. Service AuthService adapté
+
+**auth.service.ts**
+```typescript
+import { Injectable } from '@angular/core';
+import { OAuthService } from 'angular-oauth2-oidc';
+import { Router } from '@angular/router';
+import { BehaviorSubject } from 'rxjs';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class AuthService {
+  private isAuthenticatedSubject = new BehaviorSubject<boolean>(false);
+  public isAuthenticated$ = this.isAuthenticatedSubject.asObservable();
+
+  constructor(
+    private oauthService: OAuthService,
+    private router: Router
+  ) {
+    this.configureOAuth();
+  }
+
+  private configureOAuth(): void {
+    this.oauthService.configure(authConfig);
+  }
+
+  public async initAuth(): Promise<boolean> {
+    try {
+      await this.oauthService.loadDiscoveryDocument();
+      const loggedIn = await this.oauthService.tryLoginCodeFlow();
+      if (loggedIn && this.oauthService.hasValidAccessToken()) {
+        this.isAuthenticatedSubject.next(true);
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error('Error during authentication initialization', error);
+      return false;
+    }
+  }
+
+  public ssoLogin(targetUrl?: string): void {
+    if (targetUrl) {
+      localStorage.setItem('auth_redirect_url', targetUrl);
+    }
+    this.oauthService.initCodeFlow();
+  }
+
+  public logout(): void {
+    this.oauthService.logOut();
+    this.isAuthenticatedSubject.next(false);
+  }
+
+  public getAccessToken(): string {
+    return this.oauthService.getAccessToken();
+  }
+
+  public getUserInfo(): any {
+    return this.oauthService.getIdentityClaims();
+  }
+
+  public isLoggedIn(): boolean {
+    return this.oauthService.hasValidAccessToken();
+  }
+
+  // Gère la redirection après authentification réussie
+  public handleAuthRedirect(): void {
+    const redirectUrl = localStorage.getItem('auth_redirect_url') || '/dashboard';
+    localStorage.removeItem('auth_redirect_url');
+    this.router.navigateByUrl(redirectUrl);
+  }
+}
+```
+
+## 3. Guard SSO adapté
+
+**sso.guard.ts**
+```typescript
+import { CanActivateFn, Router } from '@angular/router';
+import { inject } from '@angular/core';
+import { AuthService } from '../services/auth.service';
+import { SharedService } from '../services/shared.service';
+
+export const ssoGuard: CanActivateFn = (route, state) => {
+  const authService = inject(AuthService);
+  const sharedService = inject(SharedService);
+  const router = inject(Router);
+
+  // Vérifie si l'utilisateur est authentifié via OAuth2
+  if (authService.isLoggedIn()) {
+    const userInfo = authService.getUserInfo();
+    if (userInfo) {
+      sharedService.setUserInfo({
+        uid: userInfo.sub,
+        username: userInfo.preferred_username || userInfo.name,
+        avatar: userInfo.picture,
+        admin_view: userInfo.admin_view || false,
+        user_email: userInfo.email
+      });
+    }
+    return true;
+  }
+
+  // Si non authentifié, déclenche le login SSO
+  // et stocke l'URL courante pour redirection après auth
+  const currentUrl = state.url;
+  authService.ssoLogin(currentUrl);
+  return false;
+};
+```
+
+## 4. Composant Auth simplifié (optionnel)
+
+Si vous voulez garder un composant Auth pour la logique métier :
+
+**auth.component.ts**
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { AuthService } from '../../services/auth.service';
+import { SharedService } from '../../services/shared.service';
+
+@Component({
+  selector: 'app-auth',
+  template: `
+    <div class="auth-container">
+      <div *ngIf="isLoading" class="loading">
+        <p>Authentication in progress...</p>
+      </div>
+      <div *ngIf="error" class="error">
+        <p>Authentication failed: {{ error }}</p>
+        <button (click)="retryAuth()">Retry</button>
+      </div>
+    </div>
+  `,
+  styleUrls: ['./auth.component.scss']
+})
+export class AuthComponent implements OnInit {
+  isLoading = true;
+  error: string | null = null;
+
+  constructor(
+    private authService: AuthService,
+    private sharedService: SharedService
+  ) {}
+
+  ngOnInit(): void {
+    this.handleAuthentication();
+  }
+
+  private async handleAuthentication(): Promise<void> {
+    try {
+      const isAuthenticated = await this.authService.initAuth();
+
+      if (isAuthenticated) {
+        // Récupère les infos utilisateur
+        const userInfo = this.authService.getUserInfo();
+        if (userInfo) {
+          this.sharedService.setUserInfo({
+            uid: userInfo.sub,
+            username: userInfo.preferred_username || userInfo.name,
+            avatar: userInfo.picture,
+            admin_view: userInfo.admin_view || false,
+            user_email: userInfo.email
+          });
+        }
+
+        // Redirige vers la page demandée
+        this.authService.handleAuthRedirect();
+      } else {
+        this.error = 'Authentication failed. Please try again.';
+      }
+    } catch (error) {
+      console.error('Auth error:', error);
+      this.error = 'An unexpected error occurred.';
+    } finally {
+      this.isLoading = false;
+    }
+  }
+
+  retryAuth(): void {
+    this.isLoading = true;
+    this.error = null;
+    this.handleAuthentication();
+  }
+}
+```
+
+## 5. Initialisation dans AppComponent
+
+**app.component.ts**
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { AuthService } from './services/auth.service';
+
+@Component({
+  selector: 'app-root',
+  templateUrl: './app.component.html',
+  styleUrls: ['./app.component.scss']
+})
+export class AppComponent implements OnInit {
+  constructor(private authService: AuthService) {}
+
+  ngOnInit(): void {
+    // Initialise l'authentification au démarrage de l'app
+    this.authService.initAuth();
+  }
+}
+```
+
+## 6. Routes mises à jour
+
+**app-routing.module.ts**
+```typescript
+const routes: Routes = [
+  {
+    path: 'auth',
+    component: AuthComponent
+  },
+  {
+    path: 'dashboard',
+    component: DashboardComponent,
+    canActivate: [sSOGuard]  // ← Plus besoin de AuthGuard si sSOGuard gère tout
+  },
+  {
+    path: 'create-form',
+    component: DashboardComponent,
+    canActivate: [sSOGuard]
+  },
+  {
+    path: 'dashboard/:appName/load-form/:access_token',
+    component: DashboardComponent,
+    canActivate: [sSOGuard]
+  },
+  {
+    path: 'form-view/:access_token',
+    component: FormViewComponent,
+    canActivate: [sSOGuard]
+  },
+  // ... autres routes
+];
+```
+
+## Fonctionnement :
+
+1. **Utilisateur accède à `/dashboard`** → `ssoGuard` vérifie l'authentification
+2. **Si non authentifié** → Redirection vers Apigee OAuth2
+3. **Apigee redirige vers `http://localhost:4200/`** avec le code d'autorisation
+4. **Angular traite le callback** automatiquement via `tryLoginCodeFlow()`
+5. **Redirection vers l'URL originale** (`/dashboard`)
+
+C'est beaucoup plus propre comme ça !

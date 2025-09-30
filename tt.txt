@@ -1,58 +1,662 @@
-          <ng-template let-value pTemplate="item">
-            <span class="chip" [ngClass]="entryByValue(value)?.status">
-              {{ value }}
-              <i *ngIf="entryByValue(value)?.status === 'valid'"></i>
-              <i *ngIf="entryByValue(value)?.status === 'invalid'"></i>
-              <span *ngIf="entryByValue(value)?.status === 'pending'" class="chip-spinner">
-                <p-progressSpinner [style]="{width:'12px',height:'12px'}" strokeWidth="8"></p-progressSpinner>
-              </span>
-            </span>
-          </ng-template>
+# workflow
+     |---> emails
+         |--->  __init__.py
+         |---> email_manager.py
+     |---> tasks
+         |---> core
+                |--->  __init__.py
+                |--->  base.py
+                |--->  scheduler.py
+         |---> operations
+                |--->  __init__.py
+                |--->  escalate.py
+                |--->  reminder.py
+     |---> __init__.py
+     |---> celery_app.py
+     |---> exceptions.py
+     |---> managers.py
+
+
+# workflow.emails.email_manager.py
+import re
+from flask_mail import Message
+from api.extensions import mail
+from config import Config
+
+
+class MailManager:
+    SAFE_VALUES = re.compile(r'^[a-zA-Z0-9#., ()%-]+$')
+    ALLOWED_PROPERTIES = {
+        'color': lambda v: re.match(r'^#?[a-fA-F0-9]{3,6}$|^[a-zA-Z]+$', v),
+        'font-weight': lambda v: v in {'bold', 'normal'},
+        'font-style': lambda v: v == 'italic',
+        'text-decoration': lambda v: v == 'underline',
+        'background-color': lambda v: re.match(r'^#?[a-fA-F0-9]{3,6}$|^[a-zA-Z]+$', v)
+    }
+
+    @staticmethod
+    def _apply_substitutions(content: str, substitutions: dict) -> str:
+        """Replace custom markers like <:key:> or <:key=Default:> in the content."""
+
+        def replacer(match):
+            parts = match.group(1).split('=', 1)
+            key = parts[0].strip()
+            default = parts[1].strip() if len(parts) > 1 else ''
+
+            if key == 'form_link':
+                url = substitutions.get('form_url', '#')
+                label = default or "Complete the Form"
+                return (
+                    f'<a href="{url}" style="background-color:#047857; color:#ffffff; padding:12px 20px; '
+                    f'text-decoration:none; font-weight:bold; font-size:14px; display:inline-block;">'
+                    f'{label}</a>'
+                )
+
+            return str(substitutions.get(key, default or match.group(0)))
+
+        return re.sub(r'<:([^:>]+):>', replacer, content)
+
+    @staticmethod
+    def _apply_styles(content: str) -> str:
+        """Replace <:style:key=value;...:> ... </:style:> blocks with <span style="...">...<span>"""
+
+        def sanitize(value: str) -> str:
+            return value.strip().replace(';', '').replace('"', "'")
+
+        def style_replacer(match):
+            styles = match.group(1).split(';')
+            css = []
+
+            for style in styles:
+                if '=' not in style:
+                    continue
+
+                key, value = style.split('=', 1)
+                key = key.strip().lower()
+                value = sanitize(value).lower()
+
+                if key in MailManager.ALLOWED_PROPERTIES:
+                    if MailManager.ALLOWED_PROPERTIES[key](value) and MailManager.SAFE_VALUES.match(value):
+                        css.append(f"{key}: {value}")
+
+            return f'<span style="{"; ".join(css)};">{match.group(2)}</span>'
+
+        return re.sub(r'<:style:([^:]+):>((?:(?!</:style:>).)*)</:style:>', style_replacer, content, flags=re.DOTALL)
+
+    @staticmethod
+    def send_email(
+        form_container,
+        template_type: str,
+        recipient_email: str = None,
+        cc_emails: list = None,
+        substitutions: dict = None,
+        workflow_step: str = 'start'
+    ):
+        app = form_container.application
+        template = app.get_email_template(template_type)
+
+        if not template:
+            raise ValueError(f"No template of type '{template_type}' found for application '{app.name}'")
+
+        to = recipient_email or form_container.user_email
+        cc = cc_emails or form_container.cc_emails
+        mail_sender = app.mail_sender
+        access_token = form_container.access_token
+
+        # Define substitutions
+        subs = {
+            'title': form_container.title,
+            'description': form_container.description,
+            '@MANAGER': form_container.escalade_email,
+            '@PSIRT': 'emea.cib.csirt.and.monitoring@bnpparibas.com',
+            'form_url': f"{Config.APP_URL}/user-view/{access_token}",
+            'wrk_step': workflow_step.upper(),
+            'user_email': form_container.user_email,
+            **(substitutions or {})
+        }
+
+        # Apply substitutions and styling
+        subject = MailManager._apply_substitutions(template.subject, subs)
+        body = MailManager._apply_styles(MailManager._apply_substitutions(template.body, subs))
+        signature = MailManager._apply_styles(MailManager._apply_substitutions(template.signature or "", subs))
+
+        full_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>{subject}</title>
+        </head>
+        <body style="margin:0; padding:0; background-color:#f4f6f8; font-family:Arial, sans-serif;">
+            <table align="center" cellpadding="0" cellspacing="0" width="600"
+                   style="background-color:#ffffff; border:1px solid #e0e0e0;">
+                <tr><td style="padding:30px;">{body}<br><br>{signature}</td></tr>
+            </table>
+        </body>
+        </html>
+        """
+
+        msg = Message(
+            subject=subject,
+            sender=mail_sender,
+            recipients=[to],
+            cc=cc
+        )
+        msg.html = full_html
+        mail.send(msg)
+
+# workflow.tasks.core.base.py
+import logging
+from functools import wraps
+from typing import Dict, Callable
+from datetime import datetime, timedelta
+from celery import Task
+
+from api.models import Form, FormContainer, WorkflowStep
+from api.extensions import db
+from sqlalchemy.exc import SQLAlchemyError
+from workflow.exceptions import RevokeChainRequested, WorkflowConfigurationError, WorkflowException
+
+logger = logging.getLogger(__name__)
+
+
+def workflow_task(max_retries: int = 3, retry_delay: int = 60):
+    """Decorator for workflow tasks with common error handling"""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return func(self, *args, **kwargs)
+            except RevokeChainRequested as e:
+                logger.info(f"Chain revoked: {e}", extra=e.context)
+                return {'status': 'revoked', 'message': str(e)}
+            except SQLAlchemyError as e:
+                logger.error(f"Database error in {func.__name__}: {str(e)}")
+                self.retry(exc=e, countdown=retry_delay, max_retries=max_retries)
+            except Exception as e:
+                logger.error(f"Unexpected error in {func.__name__}: {str(e)}")
+                self.retry(exc=e, countdown=retry_delay, max_retries=max_retries)
+
+        return wrapper
+
+    return decorator
+
+
+class BaseWorkflowTask(Task):
+    """Base class for workflow tasks with common functionality"""
+    autoretry_for = (Exception,)
+    max_retries = 3
+    retry_backoff = True
+    retry_backoff_max = 600
+    rate_limit = '10/m'
+
+    def _handle_task(self, step_id: str, context: Dict,
+                     handler: Callable) -> Dict:
+        """Common task execution flow"""
+        step = WorkflowStep.query.get(step_id) if step_id else None
+        context.update({'step_id': step_id, 'task_id': self.request.id})
+
+        try:
+            self._validate_prerequisites(step, context)
+            result = handler(context)
+            self._finalize_step(step, 'completed')
+            return result
+
+        except RevokeChainRequested as e:
+            self._handle_revocation(step, context, e)
+            return getattr(e, "return_value", {"status": "revoked", "message": str(e)})
+
+        except Exception as e:
+            self._handle_retry(step, e)
+            raise
+
+    def _validate_prerequisites(self, step: WorkflowStep, context: Dict) -> None:
+        """Validate task prerequisites"""
+        form = Form.query.get(context['form_id'])
+        container = FormContainer.query.get(context['container_id'])
+
+        if not form or not container:
+            raise RevokeChainRequested(
+                "Form or container missing",
+                {'status': 'revoked', "message": "Form or container missing", **context}
+            )
+
+        if step and step.status != 'processing':
+            raise WorkflowException(
+                f"Invalid step state: {step.status}",
+                {'current_status': step.status,"message": f"Invalid step state: {step.status}", **context}
+            )
+
+    def _finalize_step(self, step: WorkflowStep, status: str) -> None:
+        """Finalize step processing"""
+        if step:
+            step.status = status
+            db.session.commit()
+
+    def _handle_revocation(self, step: WorkflowStep, context: Dict, error: RevokeChainRequested) -> None:
+        """Handle workflow chain revocation"""
+        if step:
+            logger.warning(f"Revoking workflow chain: {error}", extra=context)
+            step.query.filter_by(container_id=context['container_id']).update({'status': 'revoked'})
+            db.session.commit()
+
+    def _handle_retry(self, step: WorkflowStep, error: Exception) -> None:
+        """Handle task retry logic"""
+        if step:
+            step.retries += 1
+            if step.retries >= step.max_retries:
+                step.status = 'failed'
+            else:
+                step.status = 'pending'
+                step.scheduled_time = datetime.utcnow() + timedelta(hours=1)
+            db.session.commit()
+        raise error
+
+
+# workflow.tasks.core.scheduler.py
+import logging
+from datetime import datetime
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from api.models import Form, FormContainer, WorkflowStep
+from api.extensions import db
+from workflow.celery_app import celery_app as app
+
+from workflow.tasks.operations.escalate import send_escalate_task
+from workflow.tasks.operations.reminder import send_reminder_task
+
+logger = logging.getLogger(__name__)
+
+
+@app.task(bind=True)
+def process_scheduled_steps(self) -> None:
+    """Periodic task to process scheduled steps"""
+    try:
+        with db.session.begin():
+            steps = WorkflowStep.query.filter(
+                WorkflowStep.status == 'pending',
+                WorkflowStep.scheduled_time <= datetime.utcnow()
+            ).with_for_update(skip_locked=True).limit(100)
+
+            step_map = {
+                'reminder': send_reminder_task,
+                'escalation': send_escalate_task,
+                'reminder-escalation': send_escalate_task
+            }
+
+            for step in steps:
+                if not FormContainer.query.get(step.container_id):
+                    step.status = 'revoked'
+                    continue
+
+                step.status = 'processing'
+                task = step_map.get(step.step_type)
+                if task:
+                    task.apply_async(args=[step.id, step.form_id, step.container_id, step.step_index])
+        db.session.commit()
+    except SQLAlchemyError as e:
+        logger.error(f"Database error in step processing: {str(e)}")
+        db.session.rollback()
+        self.retry(countdown=300)
+    except Exception as e:
+        logger.error(f"Unexpected error in step processing: {str(e)}")
+        self.retry(countdown=600)
+
+
+# workflow.tasks.operations.escalate.py
+import logging
+from typing import Dict
+from datetime import datetime
+
+from api.models import Form, FormContainer, WorkflowStep
+from api.helpers.tools import log_timeline_event
+
+from workflow.emails.email_manager import MailManager
+from workflow.celery_app import celery_app as app
+from workflow.tasks.core.base import BaseWorkflowTask, workflow_task
+
+logger = logging.getLogger(__name__)
+
+
+@app.task(base=BaseWorkflowTask, bind=True)
+@workflow_task()
+def send_escalate_task(self, step_id: str, form_id: str, container_id: str) -> Dict:
+    """Handle escalation workflows"""
+
+    def task_handler(context: Dict) -> Dict:
+        form_container = FormContainer.query.get(context['container_id'])
+        MailManager.send_email(
+            form_container.application.mail_sender,
+            form_container.escalade_email,
+            form_container.cc_emails,
+            "Escalation Required",
+            form_container.access_token,
+            workflow_step='escalate'
+        )
+        log_timeline_event(
+            form_container,
+            form_id,
+            datetime.utcnow(),
+            "Escalation triggered",
+            'escalate'
+        )
+        return {'status': 'success', 'escalation': True}
+
+    return self._handle_task(step_id, {
+        'form_id': form_id,
+        'container_id': container_id
+    }, task_handler)
 
 
 
+# workflow.tasks.operations.reminder.py
+import logging
+from typing import Dict
+from datetime import datetime
 
-  entryByValue(v: string): TokenEntry | undefined {
-    return this.tokens.find(t => t.value === v);
-  }
+from api.models import FormContainer
+from api.helpers.tools import log_timeline_event
+
+from workflow.emails.email_manager import MailManager
+from workflow.celery_app import celery_app as app
+
+from workflow.tasks.core.base import BaseWorkflowTask, workflow_task
+
+logger = logging.getLogger(__name__)
 
 
-/* 1) Neutraliser le wrapper PrimeNG */
-:host ::ng-deep .p-chips .p-chips-token {
-  background: transparent !important;
-}
+@app.task(base=BaseWorkflowTask, bind=True)
+@workflow_task()
+def send_reminder_task(self, step_id: str, form_id: str, container_id: str, reminder_count: int) -> Dict:
+    """Send automated reminders"""
+
+    def task_handler(context: Dict) -> Dict:
+        form_container = FormContainer.query.get(context['container_id'])
+        MailManager.send_email(
+            form_container.appication.mail_sender,
+            form_container.user_email,
+            form_container.cc_emails,
+            "Please respond to the form.",
+            form_container.access_token,
+            workflow_step='reminder'
+        )
+        log_timeline_event(
+            form_container,
+            form_id,
+            datetime.utcnow(),
+            f"Reminder {reminder_count} sent",
+            'reminder'
+        )
+        return {'status': 'success', 'reminder_count': reminder_count}
+
+    return self._handle_task(step_id, {
+        'form_id': form_id,
+        'container_id': container_id,
+        'reminder_count': reminder_count
+    }, task_handler)
 
 
-/* 3) Ton chip complet (texte + statut + bouton remove) */
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: .35rem;
-  padding: .25rem .5rem .25rem .5rem;
-  border-radius: 999px;
-  font-size: .9rem;
-  line-height: 1;
+# workflow.celery_app.py
+from datetime import timedelta, datetime
+from celery import Celery
+from celery.signals import worker_ready, worker_shutdown
+from config import Config
+from api.app import create_app
+import logging
 
-  &.valid   { background-color: #d4edda; color: #155724; }
-  &.invalid { background-color: #f8d7da; color: #721c24; }
-  &.pending { background-color: #e2e3e5; color: #383d41; }
-}
+logger = logging.getLogger(__name__)
 
-.chip-status { font-size: .8rem; line-height: 1; }
 
-/* 4) Bouton remove intégré dans la pilule */
-.chip-remove {
-  appearance: none;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  line-height: 1;
-  opacity: .75;
-}
-.chip-remove:hover { opacity: 1; }
+def make_celery(app):
+    celery_app = Celery(
+        __name__,
+        broker=Config.CELERY_BROKER_URL,
+        backend=Config.CELERY_RESULT_BACKEND,
+        enable_utc=True,
+    )
 
-.chip-spinner { display: inline-flex; }
+    celery_app.conf.update(
+        broker_connection_retry_on_startup=True,
+        worker_proc_alive_timeout=20,
+        task_serializer='json',
+        result_serializer='json',
+        accept_content=['json'],
+        result_expires=timedelta(hours=6),
+        event_queue_ttl=60,
+        worker_send_task_events=True,
+        task_send_sent_event=True,
+        # security_key=Config.CELERY_SECURITY_KEY,
+        # security_certificate=Config.CELERY_SECURITY_CERT,
+        # security_cert_store=Config.CELERY_SECURITY_CERT_STORE,
+    )
+
+    # Configuration des files d'attente
+    celery_app.conf.task_queues = {
+        'beat_tasks': {
+            'exchange': 'beat',
+            'routing_key': 'beat.process',
+            'queue_arguments': {'x-max-priority': 10}
+        },
+        'default': {
+            'exchange': 'default',
+            'routing_key': 'default.process'
+        }
+    }
+
+    celery_app.conf.beat_schedule = {
+        'process-scheduled-steps': {
+            'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
+            'schedule': timedelta(seconds=300),
+            'options': {
+                'queue': 'beat_tasks',
+                'priority': 5,
+                'expires': 300
+            }
+        }
+    }
+
+    class FlaskContextTask(celery_app.Task):
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return super().__call__(*args, **kwargs)
+
+        def on_failure(self, exc, task_id, args, kwargs, einfo):
+            logger.error(f"Task {task_id} failed: {exc}")
+            super().on_failure(exc, task_id, args, kwargs, einfo)
+
+    celery_app.Task = FlaskContextTask
+
+    # Gestion des signaux
+    @worker_ready.connect
+    def worker_ready_handler(sender, **kwargs):
+        logger.info(f"Worker {sender.hostname} ready")
+
+    @worker_shutdown.connect
+    def worker_shutdown_handler(sender, **kwargs):
+        logger.info(f"Worker {sender.hostname} shutting down")
+
+    return celery_app
+
+
+app = create_app(Config)
+celery_app = make_celery(app)
+
+
+# Health Check Endpoint
+@celery_app.task(bind=True)
+def health_check(self):
+    return {
+        "status": "OK",
+        "worker": 'self.request.hostname',
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+#workflow.exceptions.py
+from typing import Optional
+
+
+class WorkflowException(Exception):
+    """Base exception for workflow errors"""
+
+    def __init__(self, message: str, context: dict = None):
+        super().__init__(message)
+        self.context = context or {}
+
+
+class RevokeChainRequested(WorkflowException):
+    """Exception for controlled chain revocation"""
+    def __init__(self, message: str, return_value: Optional[dict] = None):
+        super().__init__(message)
+        self.return_value = return_value or {"status": "revoked", "message": message}
+
+
+class WorkflowConfigurationError(WorkflowException):
+    """Exception for workflow configuration issues"""
+
+
+#workflow.managers.py
+import logging
+from typing import List, Dict
+from datetime import datetime, timedelta
+
+import pycountry
+from workalendar.registry import registry
+
+from api.models import Form, FormContainer, WorkflowStep
+from api.extensions import db
+
+from workflow.emails.email_manager import MailManager
+from workflow.exceptions import WorkflowConfigurationError
+
+logger = logging.getLogger(__name__)
+
+
+class CalendarService:
+    """Service for working days calculations"""
+
+    def __init__(self, country_code: str = 'FR'):
+        self.country_code = country_code
+        self.calendar = registry.get(country_code)() if country_code else None
+
+    def calculate_working_days(self, start_date: datetime, delay_days: int) -> datetime:
+        """Calculate target date considering working days and holidays"""
+        if not self.calendar:
+            return start_date + timedelta(days=delay_days)
+
+        current_date = start_date.date() if isinstance(start_date, datetime) else start_date
+        days_counted = 0
+        years = {start_date.year, (start_date + timedelta(days=delay_days * 2 + 365)).year}
+        public_holidays = set().union(*(self.calendar.holidays(year) for year in years))
+
+        while days_counted < delay_days:
+            current_date += timedelta(days=1)
+            if self.calendar.is_working_day(current_date) and current_date not in public_holidays:
+                days_counted += 1
+
+        return datetime.combine(current_date, datetime.min.time())
+
+
+class WorkflowStepCreator:
+    """Factory for creating workflow steps"""
+
+    @staticmethod
+    def create_step(form_id: str, container_id: str, step_config: Dict, eta: datetime) -> WorkflowStep:
+        """Create a WorkflowStep instance from configuration"""
+        return WorkflowStep(
+            form_id=form_id,
+            container_id=container_id,
+            step_type=step_config['type'],
+            step_index=step_config.get('index', 0),
+            scheduled_time=eta,
+            max_retries=step_config.get('max_retries', 3)
+        )
+
+
+class WorkflowManager:
+    """Orchestrator for workflow initialization and management"""
+    DEFAULT_COUNTRY = 'FR'
+
+    def __init__(self, form_container: FormContainer):
+        self.form_container = form_container
+        self.calendar_service = CalendarService(self._get_country_code())
+
+    @property
+    def workflow_config(self) -> List[Dict]:
+        """Get workflow steps configuration"""
+        return getattr(self.form_container.workflow, 'steps', [])
+
+    @property
+    def base_task_kwargs(self) -> Dict:
+        """Common arguments for all workflow steps"""
+        return {
+            'form_id': self.form_container.form_id,
+            'container_id': self.form_container.id,
+            'escalate': self.form_container.escalate,
+            'use_working_days': self.form_container.use_working_days
+        }
+
+    def start_workflow(self) -> None:
+        """Main entry point to start a workflow"""
+        self._validate_workflow()
+        self._send_initial_notification()
+        self._create_workflow_steps()
+
+    def _get_country_code(self) -> str:
+        """Determine country code for calendar calculations"""
+        try:
+            country_name = self._get_user_country()
+            return pycountry.countries.lookup(country_name).alpha_2
+        except (LookupError, AttributeError) as e:
+            logger.warning(f"Using default country code: {e}")
+            return self.DEFAULT_COUNTRY
+
+    def _get_user_country(self) -> str:
+        """Get user's country (simplified for example)"""
+        return 'France'
+
+    def _validate_workflow(self) -> None:
+        """Validate workflow configuration"""
+        if not self.workflow_config:
+            raise WorkflowConfigurationError(
+                "No workflow steps configured",
+                {'container_id': self.form_container.id}
+            )
+
+    def _send_initial_notification(self) -> None:
+        """Send initial form notification"""
+        MailManager.send_email(
+            form_container=self.form_container,
+            template_type='escalate')
+
+    def _create_workflow_steps(self) -> None:
+        """Create all workflow steps in database"""
+        cumulative_delay = 0
+        steps = []
+
+        for step_config in self.workflow_config:
+            cumulative_delay += step_config.get('delay', 1)
+            eta = self._calculate_step_eta(cumulative_delay)
+            steps.append(
+                WorkflowStepCreator.create_step(
+                    self.form_container.form_id,
+                    self.form_container.id,
+                    step_config,
+                    eta
+                )
+            )
+
+        db.session.bulk_save_objects(steps)
+        db.session.commit()
+        logger.info(f"Created {len(steps)} workflow steps for container {self.form_container.id}")
+
+    def _calculate_step_eta(self, delay_days: int) -> datetime:
+        """Calculate step execution time"""
+        if self.form_container.use_working_days:
+            return self.calendar_service.calculate_working_days(
+                datetime.utcnow(),
+                delay_days
+            )
+        return datetime.utcnow() + timedelta(days=delay_days)
