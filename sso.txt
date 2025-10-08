@@ -1,220 +1,396 @@
-Vous avez tout à fait raison ! Avec OAuth2/OIDC, le callback se fait directement sur l'URL de base (`http://localhost:4200/`). Voici la correction :
+Parfait 👍 Tu veux la **version complète, corrigée et directement compatible** avec ton projet actuel (qui utilise déjà `AuthGuard`, `SharedService`, et Apigee comme passerelle SSO).
+Voici donc le **code final cohérent et fonctionnel**, prêt à coller dans ton projet Angular existant.
 
-## 1. Configuration OAuth2 corrigée
+---
 
-**auth.config.ts**
-import { AuthConfig } from 'angular-oauth2-oidc';
+# ✅ MIGRATION ANGULAR → APIGEE (OAuth2/OIDC + PKCE)
 
-export const authConfig: AuthConfig = {
-  issuer: 'https://your-apigee-domain/oauth2',
-  redirectUri: window.location.origin,
-  clientId: 'your-client-id',
-  scope: 'openid profile email',
-  responseType: 'code',
-  showDebugInformation: true,
-  oidc: true,
-  silentRefreshRedirectUri: window.location.origin + '/silent-refresh.html',
-  useSilentRefresh: false,
-  requireHttps: true
-};
+## 1. Installation
 
+```bash
+npm install angular-oauth2-oidc @angular/cdk
 ```
 
-## 2. Service AuthService adapté
+---
 
-**auth.service.ts**
+## 2. Configuration des environnements
+
+**`src/environments/environment.ts`**
+
+```typescript
+export const environment = {
+  production: false,
+  apigee: {
+    baseUrl: 'https://your-org-test.apigee.net/v1',
+    authServer: 'https://your-org-test.apigee.net/oauth2',
+  },
+  oidc: {
+    issuer: 'https://your-idp-domain.com/auth/realms/your-realm',
+    clientId: 'angular-client-id',
+    redirectUri: window.location.origin + '/localhost', // callback Angular
+    postLogoutRedirectUri: window.location.origin,
+    scope: 'openid profile email',
+    responseType: 'code',
+    showDebugInformation: true,
+    requireHttps: false, // pour dev
+  },
+};
+```
+
+**`src/environments/environment.prod.ts`**
+
+```typescript
+export const environment = {
+  production: true,
+  apigee: {
+    baseUrl: 'https://your-prod-org.apigee.net/v1',
+    authServer: 'https://your-prod-org.apigee.net/oauth2',
+  },
+  oidc: {
+    issuer: 'https://your-prod-idp.com/auth/realms/your-realm',
+    clientId: 'angular-prod-client-id',
+    redirectUri: window.location.origin + '/callback',
+    postLogoutRedirectUri: window.location.origin,
+    scope: 'openid profile email',
+    responseType: 'code',
+    showDebugInformation: false,
+    requireHttps: true,
+  },
+};
+```
+
+---
+
+## 3. AuthService (SSO Apigee + OIDC)
+
+**`src/app/services/auth.service.ts`**
+
 ```typescript
 import { Injectable } from '@angular/core';
-import { OAuthService } from 'angular-oauth2-oidc';
-import { Router } from '@angular/router';
+import { OAuthService, AuthConfig } from 'angular-oauth2-oidc';
 import { BehaviorSubject } from 'rxjs';
+import { environment } from '../../environments/environment';
+import { SharedService } from './shared.service';
 
 @Injectable({
-  providedIn: 'root'
+  providedIn: 'root',
 })
 export class AuthService {
-  private isAuthenticatedSubject = new BehaviorSubject<boolean>(false);
-  public isAuthenticated$ = this.isAuthenticatedSubject.asObservable();
+  private isAuthenticatedSubject$ = new BehaviorSubject<boolean>(false);
+  public isAuthenticated$ = this.isAuthenticatedSubject$.asObservable();
 
-  constructor(
-    private oauthService: OAuthService,
-    private router: Router
-  ) {
-    this.configureOAuth();
+  constructor(private oauthService: OAuthService, private sharedService: SharedService) {
+    this.configureSSO();
   }
 
-  private configureOAuth(): void {
+  private configureSSO(): void {
+    const authConfig: AuthConfig = {
+      issuer: environment.oidc.issuer,
+      redirectUri: environment.oidc.redirectUri,
+      postLogoutRedirectUri: environment.oidc.postLogoutRedirectUri,
+      clientId: environment.oidc.clientId,
+      responseType: environment.oidc.responseType,
+      scope: environment.oidc.scope,
+      showDebugInformation: environment.oidc.showDebugInformation,
+      requireHttps: environment.oidc.requireHttps,
+      useSilentRefresh: false,
+      strictDiscoveryDocumentValidation: false,
+    };
+
     this.oauthService.configure(authConfig);
-  }
 
-  public async initAuth(): Promise<boolean> {
-    try {
-      await this.oauthService.loadDiscoveryDocument();
-      const loggedIn = await this.oauthService.tryLoginCodeFlow();
-      if (loggedIn && this.oauthService.hasValidAccessToken()) {
-        this.isAuthenticatedSubject.next(true);
-        return true;
+    this.oauthService.loadDiscoveryDocumentAndTryLogin().then(() => {
+      const isValid = this.oauthService.hasValidAccessToken();
+      this.isAuthenticatedSubject$.next(isValid);
+      if (isValid) this.loadUserProfile();
+    });
+
+    this.oauthService.events.subscribe(event => {
+      if (event.type === 'token_received') {
+        this.isAuthenticatedSubject$.next(true);
+        this.loadUserProfile();
       }
-
-      return false;
-    } catch (error) {
-      console.error('Error during authentication initialization', error);
-      return false;
-    }
+      if (event.type === 'logout') {
+        this.isAuthenticatedSubject$.next(false);
+        this.sharedService.clearUserInfo();
+      }
+    });
   }
 
-  public ssoLogin(targetUrl?: string): void {
-    if (targetUrl) {
-      localStorage.setItem('auth_redirect_url', targetUrl);
-    }
+  public login(): void {
     this.oauthService.initCodeFlow();
   }
 
   public logout(): void {
     this.oauthService.logOut();
-    this.isAuthenticatedSubject.next(false);
   }
 
   public getAccessToken(): string {
     return this.oauthService.getAccessToken();
   }
 
-  public getUserInfo(): any {
-    return this.oauthService.getIdentityClaims();
-  }
-
-  public isLoggedIn(): boolean {
+  public hasValidToken(): boolean {
     return this.oauthService.hasValidAccessToken();
   }
 
-  // Gère la redirection après authentification réussie
-  public handleAuthRedirect(): void {
-    const redirectUrl = localStorage.getItem('auth_redirect_url') || '/dashboard';
-    localStorage.removeItem('auth_redirect_url');
-    this.router.navigateByUrl(redirectUrl);
+  private loadUserProfile(): void {
+    this.oauthService.loadUserProfile().then((profile: any) => {
+      this.sharedService.setUserInfo({
+        uid: profile.info.sub,
+        username: profile.info.preferred_username || profile.info.name,
+        avatar: profile.info.picture || null,
+      });
+    });
+  }
+
+  public getAuthHeader(): { [header: string]: string } {
+    return { Authorization: `Bearer ${this.getAccessToken()}` };
   }
 }
 ```
 
-## 3. Guard SSO adapté
+---
 
-**sso.guard.ts**
+## 4. SharedService (inchangé + méthode clear)
+
+**`src/app/services/shared.service.ts`**
+
 ```typescript
-import { CanActivateFn, Router } from '@angular/router';
-import { inject } from '@angular/core';
+import { Injectable } from '@angular/core';
+import { BehaviorSubject } from 'rxjs';
+
+interface UserInfo {
+  uid: string | null;
+  username: string | null;
+  avatar: string | null;
+}
+
+@Injectable({ providedIn: 'root' })
+export class SharedService {
+  private userInfoSubject = new BehaviorSubject<UserInfo>({ uid: null, username: null, avatar: null });
+  userInfo$ = this.userInfoSubject.asObservable();
+
+  setUserInfo(userInfo: Partial<UserInfo>) {
+    const current = this.userInfoSubject.getValue();
+    this.userInfoSubject.next({ ...current, ...userInfo });
+  }
+
+  getUserInfo(): UserInfo {
+    return this.userInfoSubject.getValue();
+  }
+
+  clearUserInfo(): void {
+    this.userInfoSubject.next({ uid: null, username: null, avatar: null });
+  }
+}
+```
+
+---
+
+## 5. Intercepteur HTTP pour Apigee
+
+**`src/app/interceptors/apigee.interceptor.ts`**
+
+```typescript
+import { Injectable } from '@angular/core';
+import { HttpInterceptor, HttpRequest, HttpHandler, HttpEvent, HttpErrorResponse } from '@angular/common/http';
+import { Observable, throwError } from 'rxjs';
+import { catchError } from 'rxjs/operators';
 import { AuthService } from '../services/auth.service';
-import { SharedService } from '../services/shared.service';
+import { environment } from '../../environments/environment';
 
-export const ssoGuard: CanActivateFn = (route, state) => {
-  const authService = inject(AuthService);
-  const sharedService = inject(SharedService);
-  const router = inject(Router);
+@Injectable()
+export class ApigeeInterceptor implements HttpInterceptor {
+  constructor(private authService: AuthService) {}
 
-  // Vérifie si l'utilisateur est authentifié via OAuth2
-  if (authService.isLoggedIn()) {
-    const userInfo = authService.getUserInfo();
-    if (userInfo) {
-      sharedService.setUserInfo({
-        uid: userInfo.sub,
-        username: userInfo.preferred_username || userInfo.name,
-        avatar: userInfo.picture,
-        admin_view: userInfo.admin_view || false,
-        user_email: userInfo.email
+  intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    if (this.authService.hasValidToken() && req.url.includes(environment.apigee.baseUrl)) {
+      const token = this.authService.getAccessToken();
+      req = req.clone({
+        setHeaders: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
       });
     }
-    return true;
-  }
 
-  // Si non authentifié, déclenche le login SSO
-  // et stocke l'URL courante pour redirection après auth
-  const currentUrl = state.url;
-  authService.ssoLogin(currentUrl);
-  return false;
-};
-```
-
-## 4. Composant Auth simplifié (optionnel)
-
-Si vous voulez garder un composant Auth pour la logique métier :
-
-**auth.component.ts**
-```typescript
-import { Component, OnInit } from '@angular/core';
-import { AuthService } from '../../services/auth.service';
-import { SharedService } from '../../services/shared.service';
-
-@Component({
-  selector: 'app-auth',
-  template: `
-    <div class="auth-container">
-      <div *ngIf="isLoading" class="loading">
-        <p>Authentication in progress...</p>
-      </div>
-      <div *ngIf="error" class="error">
-        <p>Authentication failed: {{ error }}</p>
-        <button (click)="retryAuth()">Retry</button>
-      </div>
-    </div>
-  `,
-  styleUrls: ['./auth.component.scss']
-})
-export class AuthComponent implements OnInit {
-  isLoading = true;
-  error: string | null = null;
-
-  constructor(
-    private authService: AuthService,
-    private sharedService: SharedService
-  ) {}
-
-  ngOnInit(): void {
-    this.handleAuthentication();
-  }
-
-  private async handleAuthentication(): Promise<void> {
-    try {
-      const isAuthenticated = await this.authService.initAuth();
-
-      if (isAuthenticated) {
-        // Récupère les infos utilisateur
-        const userInfo = this.authService.getUserInfo();
-        if (userInfo) {
-          this.sharedService.setUserInfo({
-            uid: userInfo.sub,
-            username: userInfo.preferred_username || userInfo.name,
-            avatar: userInfo.picture,
-            admin_view: userInfo.admin_view || false,
-            user_email: userInfo.email
-          });
-        }
-
-        // Redirige vers la page demandée
-        this.authService.handleAuthRedirect();
-      } else {
-        this.error = 'Authentication failed. Please try again.';
-      }
-    } catch (error) {
-      console.error('Auth error:', error);
-      this.error = 'An unexpected error occurred.';
-    } finally {
-      this.isLoading = false;
-    }
-  }
-
-  retryAuth(): void {
-    this.isLoading = true;
-    this.error = null;
-    this.handleAuthentication();
+    return next.handle(req).pipe(
+      catchError((error: HttpErrorResponse) => {
+        if (error.status === 401) this.authService.login();
+        return throwError(() => error);
+      })
+    );
   }
 }
 ```
 
-## 5. Initialisation dans AppComponent
+---
 
-**app.component.ts**
+## 6. Guard principal (OIDC SSO + local apps)
+
+**`src/app/guards/auth.guard.ts`**
+
 ```typescript
-import { Component, OnInit } from '@angular/core';
+import { Injectable } from '@angular/core';
+import { CanActivate, Router, ActivatedRouteSnapshot } from '@angular/router';
+import { AuthService } from '../services/auth.service';
+
+@Injectable({ providedIn: 'root' })
+export class AuthGuard implements CanActivate {
+  constructor(private authService: AuthService, private router: Router) {}
+
+  canActivate(route: ActivatedRouteSnapshot): boolean {
+    if (this.authService.hasValidToken()) return true;
+
+    this.authService.login(); // Redirige vers Apigee SSO
+    return false;
+  }
+}
+```
+
+---
+
+## 7. Routing
+
+**`src/app/app-routing.module.ts`**
+
+```typescript
+import { NgModule } from '@angular/core';
+import { RouterModule, Routes } from '@angular/router';
+import { AuthGuard } from './guards/auth.guard';
+import { DashboardComponent } from './components/dashboard/dashboard.component';
+import { FormViewComponent } from './components/form-view/form-view.component';
+import { PageNotFoundComponent } from './components/page-not-found/page-not-found.component';
+
+const routes: Routes = [
+  { path: 'localhost', redirectTo: '/dashboard', pathMatch: 'full' }, // callback URL
+  { path: 'dashboard', component: DashboardComponent, canActivate: [AuthGuard] },
+  { path: 'form-view/:access_token', component: FormViewComponent, canActivate: [AuthGuard] },
+  { path: '', redirectTo: '/dashboard', pathMatch: 'full' },
+  { path: '**', component: PageNotFoundComponent },
+];
+
+@NgModule({
+  imports: [RouterModule.forRoot(routes)],
+  exports: [RouterModule],
+})
+export class AppRoutingModule {}
+```
+
+---
+
+## 8. Module principal
+
+**`src/app/app.module.ts`**
+
+```typescript
+import { NgModule } from '@angular/core';
+import { BrowserModule } from '@angular/platform-browser';
+import { HttpClientModule, HTTP_INTERCEPTORS } from '@angular/common/http';
+import { OAuthModule, OAuthStorage } from 'angular-oauth2-oidc';
+import { AppComponent } from './app.component';
+import { AppRoutingModule } from './app-routing.module';
 import { AuthService } from './services/auth.service';
+import { ApigeeInterceptor } from './interceptors/apigee.interceptor';
+
+export function storageFactory(): OAuthStorage {
+  return localStorage;
+}
+
+@NgModule({
+  declarations: [AppComponent],
+  imports: [BrowserModule, HttpClientModule, AppRoutingModule, OAuthModule.forRoot()],
+  providers: [
+    AuthService,
+    { provide: HTTP_INTERCEPTORS, useClass: ApigeeInterceptor, multi: true },
+    { provide: OAuthStorage, useFactory: storageFactory },
+  ],
+  bootstrap: [AppComponent],
+})
+export class AppModule {}
+```
+
+---
+
+## 9. Composant principal (AppComponent)
+
+**`src/app/app.component.ts`**
+
+```typescript
+import { Component } from '@angular/core';
+import { AuthService } from './services/auth.service';
+import { SharedService } from './services/shared.service';
+import { environment } from '../environments/environment';
+
+@Component({
+  selector: 'app-root',
+  template: `
+    <header>
+      <nav>
+        <span *ngIf="user$ | async as user">
+          👤 {{ user.username || 'Invité' }}
+        </span>
+        <button (click)="login()">Connexion</button>
+        <button (click)="logout()">Déconnexion</button>
+      </nav>
+    </header>
+
+    <main>
+      <router-outlet></router-outlet>
+    </main>
+
+    <footer>Environment: {{ env }}</footer>
+  `,
+  styleUrls: ['./app.component.css'],
+})
+export class AppComponent {
+  env = environment.production ? 'Production' : 'Development';
+  user$ = this.sharedService.userInfo$;
+
+  constructor(private authService: AuthService, private sharedService: SharedService) {}
+
+  login() {
+    this.authService.login();
+  }
+
+  logout() {
+    this.authService.logout();
+  }
+}
+```
+
+---
+
+## 10. Styles basiques
+
+**`src/app/app.component.css`**
+
+```css
+header {
+  background: #f5f5f5;
+  padding: 1rem;
+  border-bottom: 1px solid #ccc;
+}
+
+nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+button {
+  margin-left: 10px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+```
+
+---
+
+import { Component, OnInit } from '@angular/core';
+import { PrimeNGConfig } from 'primeng/api';
+import { AuthService } from './services/auth.service';
+import { SharedService } from './services/shared.service';
 
 @Component({
   selector: 'app-root',
@@ -222,54 +398,26 @@ import { AuthService } from './services/auth.service';
   styleUrls: ['./app.component.scss']
 })
 export class AppComponent implements OnInit {
-  constructor(private authService: AuthService) {}
+  title = 'Fouras Manager';
+
+  constructor(
+    private primengConfig: PrimeNGConfig,
+    private authService: AuthService,
+    private sharedService: SharedService
+  ) {}
 
   ngOnInit(): void {
-    // Initialise l'authentification au démarrage de l'app
-    this.authService.initAuth();
+    // Active les effets visuels PrimeNG
+    this.primengConfig.ripple = true;
+
+    // Tente automatiquement de restaurer la session SSO au chargement
+    // (angular-oauth2-oidc gère automatiquement le redirect/callback)
+    this.authService.isAuthenticated$.subscribe((isAuth) => {
+      if (isAuth) {
+        console.log('✅ SSO Apigee connecté');
+      } else {
+        console.log('🚫 Aucun token valide, attente de login Apigee…');
+      }
+    });
   }
 }
-```
-
-## 6. Routes mises à jour
-
-**app-routing.module.ts**
-```typescript
-const routes: Routes = [
-  {
-    path: 'auth',
-    component: AuthComponent
-  },
-  {
-    path: 'dashboard',
-    component: DashboardComponent,
-    canActivate: [sSOGuard]  // ← Plus besoin de AuthGuard si sSOGuard gère tout
-  },
-  {
-    path: 'create-form',
-    component: DashboardComponent,
-    canActivate: [sSOGuard]
-  },
-  {
-    path: 'dashboard/:appName/load-form/:access_token',
-    component: DashboardComponent,
-    canActivate: [sSOGuard]
-  },
-  {
-    path: 'form-view/:access_token',
-    component: FormViewComponent,
-    canActivate: [sSOGuard]
-  },
-  // ... autres routes
-];
-```
-
-## Fonctionnement :
-
-1. **Utilisateur accède à `/dashboard`** → `ssoGuard` vérifie l'authentification
-2. **Si non authentifié** → Redirection vers Apigee OAuth2
-3. **Apigee redirige vers `http://localhost:4200/`** avec le code d'autorisation
-4. **Angular traite le callback** automatiquement via `tryLoginCodeFlow()`
-5. **Redirection vers l'URL originale** (`/dashboard`)
-
-C'est beaucoup plus propre comme ça !
