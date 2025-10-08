@@ -421,3 +421,24 @@ export class AppComponent implements OnInit {
     });
   }
 }
+
+
+
+// src/app/guards/sso.guard.ts
+import { inject } from '@angular/core';
+import { CanActivateFn, Router } from '@angular/router';
+import { AuthService } from '../services/auth.service';
+
+export const sSOGuard: CanActivateFn = () => {
+  const authService = inject(AuthService);
+  const router = inject(Router);
+
+  // ✅ Si le token SSO OIDC est valide → on laisse passer
+  if (authService.hasValidToken()) {
+    return true;
+  }
+
+  // ❌ Sinon → déclenche l’authentification SSO via Apigee
+  authService.login(); // lance la redirection vers Apigee
+  return false;
+};
