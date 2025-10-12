@@ -139,3 +139,416 @@ N'oubliez pas de :
 - Sécuriser les tokens dans le stockage local
 
 Cette configuration utilise le flux Authorization Code avec PKCE, recommandé pour les applications clientes publiques comme les SPAs Angular.
+
+
+
+
+  public loadUserProfile(): void {
+    this.oauthService.loadUserProfile().then(profile => {
+      this.userProfileSubject.next(profile);
+      console.log('Profile utilisateur:', profile);
+    }).catch(error => {
+      console.error('Erreur chargement profil:', error);
+    });
+  }
+
+
+  @Component({
+  template: '<p>Traitement de l\'authentification...</p>'
+})
+export class CallbackComponent implements OnInit {
+  constructor(
+    private oauthService: OAuthService,
+    private authService: AuthService,
+    private router: Router
+  ) {}
+
+  async ngOnInit() {
+    try {
+      await this.oauthService.loadDiscoveryDocumentAndTryLogin();
+
+      if (this.oauthService.hasValidAccessToken()) {
+        // Récupération du profil utilisateur
+        await this.authService.loadUserProfile();
+
+        // Redirection vers la page d'accueil ou page demandée
+        const redirectUrl = this.oauthService.state || '/';
+        this.router.navigate([redirectUrl]);
+      } else {
+        this.router.navigate(['/login']);
+      }
+    } catch (error) {
+      console.error('Erreur lors du callback:', error);
+      this.router.navigate(['/login']);
+    }
+  }
+}
+
+
+
+
+import { Injectable } from '@angular/core';
+import { HttpEvent, HttpHandler, HttpInterceptor, HttpRequest } from '@angular/common/http';
+import { OAuthService } from 'angular-oauth2-oidc';
+import { Observable } from 'rxjs';
+
+@Injectable()
+export class AuthInterceptor implements HttpInterceptor {
+  constructor(private oauthService: OAuthService) {}
+
+  intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    // Vérifier si la requête est vers votre backend protégé par Apigee
+    if (this.isApiRequest(req.url)) {
+      const token = this.oauthService.getAccessToken();
+
+      if (token) {
+        const cloned = req.clone({
+          setHeaders: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+        return next.handle(cloned);
+      }
+    }
+
+    return next.handle(req);
+  }
+
+  private isApiRequest(url: string): boolean {
+    // Liste des URLs qui nécessitent le token
+    const apiUrls = [
+      'https://votre-api-gateway.apigee.net',
+      'https://votre-backend.com/api'
+    ];
+
+    return apiUrls.some(apiUrl => url.startsWith(apiUrl));
+  }
+}
+
+
+
+
+
+private configure() {
+  this.oauthService.configure(authConfig);
+
+  // Configurer le silent refresh
+  this.oauthService.setupAutomaticSilentRefresh();
+
+  this.oauthService.events.subscribe(event => {
+    if (event.type === 'token_refreshed') {
+      console.log('Token rafraîchi automatiquement');
+    }
+  });
+
+  this.oauthService.loadDiscoveryDocumentAndTryLogin().then(() => {
+    if (this.oauthService.hasValidAccessToken()) {
+      this.loadUserProfile();
+    }
+  });
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Vous avez raison ! Apigee ne fournit pas toujours un endpoint de discovery OIDC standard. Voici comment configurer sans utiliser `loadDiscoveryDocumentAndTryLogin` :
+
+## Configuration manuelle sans Discovery Document
+
+### 1. Config statique complète :
+
+```typescript
+import { AuthConfig } from 'angular-oauth2-oidc';
+
+export const authConfig: AuthConfig = {
+  // Désactive la découverte automatique
+  skipIssuerCheck: true,
+  strictDiscoveryDocumentValidation: false,
+
+  // URLs spécifiques à Apigee
+  issuer: 'https://your-apigee-domain', // ou l'URL de votre tenant Apigee
+  tokenEndpoint: 'https://your-apigee-domain/oauth2/token',
+  authorizationEndpoint: 'https://your-apigee-domain/oauth2/authorize',
+  userinfoEndpoint: 'https://your-apigee-domain/oauth2/userinfo', // si disponible
+  logoutUrl: 'https://your-apigee-domain/oauth2/logout', // si disponible
+
+  // Configuration client
+  clientId: 'your-client-id-from-apigee',
+  redirectUri: window.location.origin + '/callback',
+  responseType: 'code',
+  scope: 'openid profile email',
+
+  // PKCE (recommandé pour les SPA)
+  oidc: true,
+  useSilentRefresh: false, // À ajuster selon vos besoins
+  showDebugInformation: true
+};
+```
+
+### 2. Service d'authentification modifié :
+
+```typescript
+import { Injectable } from '@angular/core';
+import { OAuthService, OAuthEvent } from 'angular-oauth2-oidc';
+import { Router } from '@angular/router';
+
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  private userProfileSubject = new BehaviorSubject<any>(null);
+  public userProfile$ = this.userProfileSubject.asObservable();
+
+  constructor(
+    private oauthService: OAuthService,
+    private router: Router
+  ) {
+    this.configure();
+  }
+
+  private configure() {
+    // Configuration manuelle sans discovery document
+    this.oauthService.configure(authConfig);
+
+    // Événements OAuth
+    this.oauthService.events.subscribe((event: OAuthEvent) => {
+      if (event.type === 'token_received') {
+        console.log('Token reçu');
+        this.loadUserProfile();
+      }
+    });
+
+    // Vérification au chargement de l'application
+    this.tryLogin();
+  }
+
+  public tryLogin(): Promise<void> {
+    return this.oauthService.tryLogin().then(() => {
+      if (this.oauthService.hasValidAccessToken()) {
+        console.log('Token valide trouvé');
+        this.loadUserProfile();
+        return Promise.resolve();
+      }
+    }).catch(error => {
+      console.error('Erreur lors du tryLogin:', error);
+      return Promise.reject(error);
+    });
+  }
+
+  public initLoginFlow(): void {
+    this.oauthService.initLoginFlow();
+  }
+
+  public loadUserProfile(): void {
+    if (this.oauthService.hasValidAccessToken()) {
+      // Si Apigee fournit un endpoint userinfo
+      if (authConfig.userinfoEndpoint) {
+        this.oauthService.loadUserProfile().then(profile => {
+          this.userProfileSubject.next(profile);
+        }).catch(error => {
+          console.warn('Impossible de charger le profil:', error);
+          // Créer un profil basique à partir du token
+          this.createBasicProfileFromToken();
+        });
+      } else {
+        // Créer un profil à partir des claims du token
+        this.createBasicProfileFromToken();
+      }
+    }
+  }
+
+  private createBasicProfileFromToken(): void {
+    const claims = this.oauthService.getIdentityClaims();
+    if (claims) {
+      this.userProfileSubject.next(claims);
+    } else {
+      // Extraire les informations du token d'accès
+      const token = this.oauthService.getAccessToken();
+      if (token) {
+        try {
+          const payload = JSON.parse(atob(token.split('.')[1]));
+          this.userProfileSubject.next({
+            sub: payload.sub,
+            name: payload.name,
+            email: payload.email,
+            // autres claims que vous attendez
+          });
+        } catch (e) {
+          console.warn('Impossible de parser le token:', e);
+        }
+      }
+    }
+  }
+
+  public logout(): void {
+    this.oauthService.logOut();
+    this.userProfileSubject.next(null);
+  }
+
+  public get isLoggedIn(): boolean {
+    return this.oauthService.hasValidAccessToken();
+  }
+
+  public get accessToken(): string {
+    return this.oauthService.getAccessToken();
+  }
+}
+```
+
+### 3. Callback Component modifié :
+
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { ActivatedRoute, Router } from '@angular/router';
+import { OAuthService } from 'angular-oauth2-oidc';
+
+@Component({
+  template: `
+    <div class="callback-container">
+      <p>Traitement de l'authentification...</p>
+      <div *ngIf="error" class="error">
+        Erreur: {{ error }}
+      </div>
+    </div>
+  `
+})
+export class CallbackComponent implements OnInit {
+  error: string = '';
+
+  constructor(
+    private oauthService: OAuthService,
+    private authService: AuthService,
+    private router: Router,
+    private route: ActivatedRoute
+  ) {}
+
+  async ngOnInit() {
+    try {
+      // Traiter la réponse OAuth sans discovery document
+      await this.oauthService.tryLogin();
+
+      if (this.oauthService.hasValidAccessToken()) {
+        // Charger le profil utilisateur
+        await this.authService.loadUserProfile();
+
+        // Rediriger vers la page d'origine ou la page par défaut
+        const returnUrl = this.route.snapshot.queryParams['state'] || '/';
+        this.router.navigateByUrl(returnUrl);
+      } else {
+        this.error = 'Échec de l\'authentification';
+        setTimeout(() => this.router.navigate(['/login']), 3000);
+      }
+    } catch (error) {
+      console.error('Erreur dans le callback:', error);
+      this.error = error.message || 'Erreur inconnue';
+      setTimeout(() => this.router.navigate(['/login']), 3000);
+    }
+  }
+}
+```
+
+### 4. Guard d'authentification :
+
+```typescript
+import { Injectable } from '@angular/core';
+import { CanActivate, Router } from '@angular/router';
+import { AuthService } from './auth.service';
+
+@Injectable({ providedIn: 'root' })
+export class AuthGuard implements CanActivate {
+  constructor(private authService: AuthService, private router: Router) {}
+
+  canActivate(): Promise<boolean> {
+    return new Promise((resolve) => {
+      if (this.authService.isLoggedIn) {
+        resolve(true);
+      } else {
+        // Essayer de voir si on a un token dans l'URL (cas du retour de callback)
+        this.authService.tryLogin().then(() => {
+          if (this.authService.isLoggedIn) {
+            resolve(true);
+          } else {
+            this.authService.initLoginFlow();
+            resolve(false);
+          }
+        }).catch(() => {
+          this.authService.initLoginFlow();
+          resolve(false);
+        });
+      }
+    });
+  }
+}
+```
+
+### 5. Initialisation de l'app :
+
+```typescript
+// app.component.ts
+export class AppComponent implements OnInit {
+  constructor(private authService: AuthService) {}
+
+  ngOnInit() {
+    // Vérifier l'état de l'authentification au démarrage de l'app
+    this.authService.tryLogin();
+  }
+}
+```
+
+### 6. Configuration Apigee spécifique :
+
+Si Apigee a des particularités, vous pouvez les gérer ainsi :
+
+```typescript
+// Configuration pour Apigee avec des paramètres custom
+export const authConfig: AuthConfig = {
+  // ... configuration de base ...
+
+  // Paramètres spécifiques Apigee
+  customQueryParams: {
+    // Ajouter des paramètres spécifiques à Apigee si nécessaire
+    'apigee_parameter': 'value'
+  },
+
+  // Désactiver certaines validations si nécessaire
+  skipIssuerCheck: true,
+  strictDiscoveryDocumentValidation: false,
+
+  // Adapter les noms de paramètres si Apigee utilise des noms différents
+  // (normalement pas nécessaire avec les standards OAuth2)
+};
+```
+
+### Points importants :
+
+1. **`tryLogin()`** au lieu de `loadDiscoveryDocumentAndTryLogin()`
+2. **Configuration manuelle** de tous les endpoints
+3. **Gestion d'erreur** robuste pour le profil utilisateur
+4. **Validation basique** du token sans discovery document
+
+Cette approche vous permet de fonctionner avec Apigee même sans endpoint de discovery OIDC standard.
