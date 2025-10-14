@@ -1,17 +1,304 @@
-Top, ta proposition va dans le bon sens. Voici ce que je te recommande pour qu’elle soit **propre, idempotente et 100% actif-actif**, avec des corrections concrètes sur ton code actuel.
+Parfait ! Je vais combiner les deux solutions en une architecture **actif-actif robuste** avec une classe `RedisManager` professionnelle. Voici la solution complète :
 
----
+## 🎯 **Solution Finale - Architecture Actif-Active**
 
-# 0) Les 4 points clés (résumé)
+### 1. **Classe RedisManager complète** (nouveau fichier)
 
-1. **Workers Celery en parallèle** : OK, mets `worker_prefetch_multiplier=1` + `task_acks_late=True` pour éviter les doublons après crash.
-2. **Beat unique ou distribué** : un seul Beat, ou RedBeat si tu veux la tolérance de panne du scheduler.
-3. **DB** : continue à utiliser `FOR UPDATE SKIP LOCKED` et marque *immédiatement* le step “processing” sous transaction.
-4. **App context Flask** : garde une Task Celery qui pousse le contexte Flask (sinon mails/DB plantent parfois).
+```python
+# workflow/redis_manager.py
+import redis
+from redis.cluster import RedisCluster
+from datetime import timedelta, datetime
+import logging
+import uuid
+import time
+from contextlib import contextmanager
+from typing import Optional, List, Dict, Any
 
----
+logger = logging.getLogger(__name__)
 
-# 1) `workflow/celery_app.py` — version actif-actif (corrigée + complète)
+class RedisManager:
+    """
+    Manager Redis unique pour standalone et cluster
+    Utilise les fonctionnalités natives de redis-py
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self._client = None
+        self._cluster_mode = getattr(config, 'REDIS_CLUSTER_MODE', False)
+    
+    @property
+    def client(self):
+        """Client Redis lazy-loaded"""
+        if self._client is None:
+            self._client = self._create_client()
+        return self._client
+    
+    def _create_client(self):
+        """Crée le client Redis selon le mode"""
+        try:
+            if self._cluster_mode:
+                logger.info("Initializing Redis Cluster client")
+                return RedisCluster(
+                    startup_nodes=getattr(self.config, 'REDIS_CLUSTER_NODES', []),
+                    decode_responses=True,
+                    skip_full_coverage_check=True,
+                    password=getattr(self.config, 'REDIS_PASSWORD', None),
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    retry_on_timeout=True,
+                    max_connections=50
+                )
+            else:
+                logger.info("Initializing Redis Standalone client")
+                return redis.from_url(
+                    getattr(self.config, 'REDIS_URL', 'redis://localhost:6379/0'),
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    retry_on_timeout=True,
+                    max_connections=50
+                )
+        except Exception as e:
+            logger.error(f"Failed to create Redis client: {e}")
+            raise
+    
+    # 🔥 OPÉRATIONS DE BASE (compatibles cluster)
+    def setex(self, key: str, ttl: timedelta, value: str) -> bool:
+        """SETEX avec gestion d'erreurs"""
+        try:
+            return self.client.setex(key, int(ttl.total_seconds()), value)
+        except Exception as e:
+            logger.error(f"Redis SETEX error for key {key}: {e}")
+            raise
+    
+    def get(self, key: str) -> Optional[str]:
+        """GET avec gestion d'erreurs"""
+        try:
+            return self.client.get(key)
+        except Exception as e:
+            logger.error(f"Redis GET error for key {key}: {e}")
+            return None
+    
+    def keys(self, pattern: str) -> List[str]:
+        """KEYS avec fallback sur SCAN pour les clusters"""
+        try:
+            if self._cluster_mode:
+                # SCAN plus safe en cluster
+                keys = []
+                cursor = 0
+                while True:
+                    cursor, found_keys = self.client.scan(
+                        cursor=cursor, 
+                        match=pattern, 
+                        count=100
+                    )
+                    keys.extend(found_keys)
+                    if cursor == 0:
+                        break
+                return keys
+            else:
+                return self.client.keys(pattern)
+        except Exception as e:
+            logger.error(f"Redis KEYS/SCAN error for pattern {pattern}: {e}")
+            return []
+    
+    def xadd(self, stream: str, fields: Dict[str, Any], maxlen: Optional[int] = None) -> str:
+        """XADD avec truncation optionnelle"""
+        try:
+            kwargs = {}
+            if maxlen:
+                kwargs['maxlen'] = maxlen
+                kwargs['approximate'] = True
+            
+            return self.client.xadd(stream, fields, **kwargs)
+        except Exception as e:
+            logger.error(f"Redis XADD error for stream {stream}: {e}")
+            raise
+    
+    def xdel(self, stream: str, *message_ids: str) -> int:
+        """XDEL pour supprimer des messages de stream"""
+        try:
+            return self.client.xdel(stream, *message_ids)
+        except Exception as e:
+            logger.error(f"Redis XDEL error for stream {stream}: {e}")
+            return 0
+    
+    def xrange(self, stream: str, start: str = '-', end: str = '+', count: Optional[int] = None) -> List:
+        """XRANGE pour lire un stream"""
+        try:
+            return self.client.xrange(stream, min=start, max=end, count=count)
+        except Exception as e:
+            logger.error(f"Redis XRANGE error for stream {stream}: {e}")
+            return []
+    
+    # 🔥 FONCTIONNALITÉS AVANCÉES Redis 8.2.2
+    def json_set(self, key: str, path: str, obj: Any, ttl: Optional[timedelta] = None) -> bool:
+        """JSON.SET avec expiration optionnelle (Redis 8.2.2+)"""
+        try:
+            if hasattr(self.client, 'json_set'):
+                result = self.client.json_set(key, path, obj)
+                if result and ttl:
+                    self.client.expire(key, int(ttl.total_seconds()))
+                return result
+            else:
+                # Fallback si JSON non disponible
+                import json
+                result = self.client.set(key, json.dumps(obj))
+                if result and ttl:
+                    self.client.expire(key, int(ttl.total_seconds()))
+                return result
+        except Exception as e:
+            logger.error(f"Redis JSON.SET error for key {key}: {e}")
+            return False
+    
+    def json_get(self, key: str, path: str = '.') -> Optional[Any]:
+        """JSON.GET (Redis 8.2.2+)"""
+        try:
+            if hasattr(self.client, 'json_get'):
+                return self.client.json_get(key, path)
+            else:
+                # Fallback
+                import json
+                data = self.client.get(key)
+                return json.loads(data) if data else None
+        except Exception as e:
+            logger.error(f"Redis JSON.GET error for key {key}: {e}")
+            return None
+    
+    def zrandmember(self, key: str, count: int = 1) -> List[str]:
+        """ZRANDMEMBRE (Redis 8.2.2+)"""
+        try:
+            if hasattr(self.client, 'zrandmember'):
+                return self.client.zrandmember(key, count)
+            else:
+                # Fallback avec ZRANGE + random
+                import random
+                members = self.client.zrange(key, 0, -1)
+                return random.sample(members, min(count, len(members))) if members else []
+        except Exception as e:
+            logger.error(f"Redis ZRANDMEMBER error for key {key}: {e}")
+            return []
+    
+    # 🔥 LOCKS DISTRIBUÉS POUR ACTIF-ACTIF
+    def acquire_lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10) -> Optional[str]:
+        """Acquire a distributed lock with token"""
+        identifier = str(uuid.uuid4())
+        lock_key = f"lock:{lock_name}"
+        end_time = time.time() + acquire_timeout
+        
+        while time.time() < end_time:
+            try:
+                if self.client.set(lock_key, identifier, ex=timeout, nx=True):
+                    return identifier
+                time.sleep(0.1)  # 100ms
+            except Exception as e:
+                logger.error(f"Redis lock acquisition error for {lock_name}: {e}")
+                break
+        
+        return None
+    
+    def release_lock(self, lock_name: str, identifier: str) -> bool:
+        """Release lock only if owned by current process"""
+        lock_key = f"lock:{lock_name}"
+        
+        lua_script = """
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+        """
+        
+        try:
+            release_script = self.client.register_script(lua_script)
+            result = release_script(keys=[lock_key], args=[identifier])
+            return result == 1
+        except Exception as e:
+            logger.error(f"Redis lock release error for {lock_name}: {e}")
+            return False
+    
+    @contextmanager
+    def lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10):
+        """Context manager for distributed locks"""
+        identifier = self.acquire_lock(lock_name, timeout, acquire_timeout)
+        if not identifier:
+            raise Exception(f"Could not acquire lock: {lock_name}")
+        
+        try:
+            yield identifier
+        finally:
+            self.release_lock(lock_name, identifier)
+    
+    # 🔥 COORDINATION ACTIF-ACTIF
+    def register_server_heartbeat(self, server_id: str, ttl: timedelta = timedelta(seconds=60)) -> bool:
+        """Enregistre un heartbeat de serveur"""
+        try:
+            key = f"servers:heartbeats"
+            pipeline = self.client.pipeline()
+            pipeline.hset(key, server_id, datetime.utcnow().isoformat())
+            pipeline.expire(key, int(ttl.total_seconds() * 2))
+            pipeline.execute()
+            return True
+        except Exception as e:
+            logger.error(f"Redis heartbeat registration error for server {server_id}: {e}")
+            return False
+    
+    def get_active_servers(self, max_age: timedelta = timedelta(seconds=45)) -> List[str]:
+        """Retourne les serveurs actifs"""
+        try:
+            key = f"servers:heartbeats"
+            heartbeats = self.client.hgetall(key)
+            active_servers = []
+            current_time = datetime.utcnow()
+            
+            for server_id, heartbeat_str in heartbeats.items():
+                try:
+                    heartbeat_time = datetime.fromisoformat(heartbeat_str)
+                    if (current_time - heartbeat_time) < max_age:
+                        active_servers.append(server_id)
+                except ValueError:
+                    continue
+            
+            return sorted(active_servers)
+        except Exception as e:
+            logger.error(f"Redis get active servers error: {e}")
+            return []
+    
+    def is_server_leader(self, server_id: str) -> bool:
+        """Détermine si le serveur est le leader (premier dans la liste triée)"""
+        active_servers = self.get_active_servers()
+        return bool(active_servers) and active_servers[0] == server_id
+    
+    # 🔥 HEALTH CHECK
+    def health_check(self) -> Dict[str, Any]:
+        """Vérifie la santé de Redis"""
+        try:
+            start_time = time.time()
+            self.client.ping()
+            response_time = (time.time() - start_time) * 1000
+            
+            info = self.client.info()
+            
+            return {
+                "status": "healthy",
+                "response_time_ms": round(response_time, 2),
+                "redis_version": info.get('redis_version', 'unknown'),
+                "connected_clients": info.get('connected_clients', 0),
+                "used_memory_human": info.get('used_memory_human', 'unknown'),
+                "cluster_mode": self._cluster_mode
+            }
+        except Exception as e:
+            logger.error(f"Redis health check failed: {e}")
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "cluster_mode": self._cluster_mode
+            }
+```
+
+### 2. **Celery App avec RedisManager** (version corrigée)
 
 ```python
 # workflow/celery_app.py
@@ -22,6 +309,7 @@ from kombu import Queue, Exchange
 from celery.signals import worker_ready, worker_shutdown
 from config import Config
 from api.app import create_app
+from workflow.redis_manager import RedisManager
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +321,12 @@ def make_celery(flask_app):
         enable_utc=True,
     )
 
-    # ---- HA & scaling horizontal
+    # ---- Configuration HA & scaling
     celery_app.conf.update(
         # Fiabilité
-        task_acks_late=True,                 # si le worker meurt, la tâche est re-queue
-        worker_prefetch_multiplier=1,        # évite qu’un worker “aspire” trop de tâches
-        task_time_limit=300,                 # tue les tasks coincées
+        task_acks_late=True,
+        worker_prefetch_multiplier=1,
+        task_time_limit=300,
         task_soft_time_limit=270,
 
         # Broker résilient
@@ -52,12 +340,21 @@ def make_celery(flask_app):
         accept_content=['json'],
         result_expires=timedelta(hours=6),
 
-        # Events (monitoring Flower/Prometheus exporter)
+        # Events
         worker_send_task_events=True,
         task_send_sent_event=True,
     )
 
-    # ---- Files d’attente
+    # ---- RedBeat pour Beat distribué (optionnel)
+    if getattr(Config, 'REDBEAT_ENABLED', False):
+        celery_app.conf.update(
+            beat_scheduler='redbeat.RedBeatScheduler',
+            redbeat_redis_url=Config.CELERY_BROKER_URL,
+            redbeat_lock_key='redbeat:lock',
+            redbeat_key_prefix='redbeat:',
+        )
+
+    # ---- Files d'attente
     default_ex = Exchange('default', type='direct')
     beat_ex = Exchange('beat', type='direct')
     high_ex = Exchange('high_priority', type='direct')
@@ -74,16 +371,32 @@ def make_celery(flask_app):
     celery_app.conf.task_default_routing_key = 'default'
 
     celery_app.conf.task_routes = {
-        'workflow.tasks.core.scheduler.process_scheduled_steps': {'queue': 'beat_tasks', 'routing_key': 'beat.process'},
-        'workflow.tasks.operations.escalate.send_escalate_task': {'queue': 'high_priority', 'routing_key': 'high_priority', 'priority': 9},
-        'workflow.tasks.operations.reminder.send_reminder_task': {'queue': 'default', 'routing_key': 'default', 'priority': 5},
+        'workflow.tasks.core.scheduler.process_scheduled_steps': {
+            'queue': 'beat_tasks', 
+            'routing_key': 'beat.process'
+        },
+        'workflow.tasks.operations.escalate.send_escalate_task': {
+            'queue': 'high_priority', 
+            'routing_key': 'high_priority', 
+            'priority': 9
+        },
+        'workflow.tasks.operations.reminder.send_reminder_task': {
+            'queue': 'default', 
+            'routing_key': 'default', 
+            'priority': 5
+        },
     }
 
-    # ---- Beat intégré (si tu gardes Beat “unique”)
+    # ---- Beat schedule avec coordination distribué
     celery_app.conf.beat_schedule = {
         'process-scheduled-steps-every-5min': {
             'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
             'schedule': timedelta(seconds=300),
+            'options': {'queue': 'beat_tasks'}
+        },
+        'distributed-health-check': {
+            'task': 'workflow.celery_app.distributed_health_check',
+            'schedule': timedelta(seconds=60),
             'options': {'queue': 'beat_tasks'}
         }
     }
@@ -96,14 +409,22 @@ def make_celery(flask_app):
 
         def on_failure(self, exc, task_id, args, kwargs, einfo):
             logger.error(f"Task {task_id} failed: {exc}")
+            # Log supplémentaire avec contexte
+            logger.error(f"Task args: {args}, kwargs: {kwargs}")
             return super().on_failure(exc, task_id, args, kwargs, einfo)
 
     celery_app.Task = FlaskContextTask
 
-    # ---- Signaux (logs)
+    # ---- Signaux avec coordination
     @worker_ready.connect
     def worker_ready_handler(sender, **kw):
         logger.info(f"Worker {sender.hostname} ready")
+        # Enregistrement du worker
+        try:
+            redis_manager = RedisManager(Config)
+            redis_manager.register_server_heartbeat(sender.hostname)
+        except Exception as e:
+            logger.error(f"Failed to register worker heartbeat: {e}")
 
     @worker_shutdown.connect
     def worker_shutdown_handler(sender, **kw):
@@ -111,34 +432,37 @@ def make_celery(flask_app):
 
     return celery_app
 
-
+# Initialisation
 flask_app = create_app(Config)
 celery_app = make_celery(flask_app)
 
+# 🔥 Health check avec RedisManager
 @celery_app.task(bind=True)
 def health_check(self):
     from datetime import datetime
+    redis_manager = RedisManager(Config)
+    
+    redis_health = redis_manager.health_check()
+    active_servers = redis_manager.get_active_servers()
+    is_leader = redis_manager.is_server_leader(self.request.hostname)
+    
     return {
         "status": "OK",
         "worker": self.request.hostname,
+        "is_leader": is_leader,
+        "active_workers": active_servers,
+        "total_workers": len(active_servers),
+        "redis": redis_health,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+@celery_app.task(bind=True)
+def distributed_health_check(self):
+    """Health check distribué pour la coordination"""
+    return health_check(self)
 ```
 
-> **Variante RedBeat (Beat distribué)** : ajoute simplement
->
-> ```python
-> celery_app.conf.beat_scheduler = 'redbeat.RedBeatScheduler'
-> celery_app.conf.redbeat_redis_url = Config.CELERY_BROKER_URL
-> ```
->
-> et tu peux lancer plusieurs Beat en parallèle.
-
----
-
-# 2) `scheduler.py` — idempotence + lock pessimiste (OK)
-
-Ton approche `with_for_update(skip_locked=True)` est la bonne. Petite retouche “defensive” :
+### 3. **Scheduler avec verrous distribués**
 
 ```python
 # workflow/tasks/core/scheduler.py
@@ -148,500 +472,152 @@ from api.models import FormContainer, WorkflowStep
 from api.extensions import db
 from datetime import datetime
 import logging
+from workflow.redis_manager import RedisManager
+from config import Config
 
 logger = logging.getLogger(__name__)
 
 @app.task(bind=True)
 def process_scheduled_steps(self) -> None:
+    """Tâche planifiée avec lock distribué pour active-active"""
+    
+    redis_manager = RedisManager(Config)
+    
+    # 🔥 Lock distribué pour éviter les duplications
     try:
-        with db.session.begin():
-            steps = (
-                WorkflowStep.query
-                .filter(
-                    WorkflowStep.status == 'pending',
-                    WorkflowStep.scheduled_time <= datetime.utcnow()
-                )
-                .with_for_update(skip_locked=True)
-                .limit(100)
-                .all()
-            )
-
-            for step in steps:
-                container = FormContainer.query.get(step.container_id)
-                if not container:
-                    step.status = 'revoked'
-                    continue
-
-                # on marque processing TOUT DE SUITE, transaction ouverte
-                step.status = 'processing'
-                step.locked_at = datetime.utcnow()
-
-                if step.step_type == 'reminder':
-                    from workflow.tasks.operations.reminder import send_reminder_task
-                    send_reminder_task.apply_async(args=[step.id, step.form_id, step.container_id, step.step_index])
-                else:
-                    from workflow.tasks.operations.escalate import send_escalate_task
-                    send_escalate_task.apply_async(args=[step.id, step.form_id, step.container_id])
-
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in step processing: {e}")
-        db.session.rollback()
-        self.retry(countdown=300)
-    except Exception as e:
-        logger.error(f"Unexpected error in step processing: {e}")
-        self.retry(countdown=600)
-```
-
----
-
-# 3) `BaseWorkflowTask` — corrections + verrous + retries propres
-
-* Corrige l’usage de `step.query` (il faut la classe `WorkflowStep`).
-* Marque `processing` sous la même transaction avant de lancer le handler.
-* Remonte correctement le statut/retries.
-
-```python
-# workflow/tasks/core/base.py
-import logging
-from functools import wraps
-from typing import Dict, Callable
-from datetime import datetime, timedelta
-from celery import Task
-
-from api.models import Form, FormContainer, WorkflowStep
-from api.extensions import db
-from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
-from workflow.exceptions import RevokeChainRequested, WorkflowConfigurationError, WorkflowException
-
-logger = logging.getLogger(__name__)
-
-def workflow_task(max_retries: int = 3, retry_delay: int = 60):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(self, *args, **kwargs):
+        with redis_manager.lock("process_scheduled_steps", timeout=300, acquire_timeout=10):
+            logger.info(f"Acquired lock for scheduled steps processing on {self.request.hostname}")
+            
+            # Rafraîchir le heartbeat
+            redis_manager.register_server_heartbeat(self.request.hostname)
+            
             try:
-                return func(self, *args, **kwargs)
-            except RevokeChainRequested as e:
-                logger.info(f"Chain revoked: {e}", extra=getattr(e, 'context', {}))
-                return {'status': 'revoked', 'message': str(e)}
+                with db.session.begin():
+                    steps = (
+                        WorkflowStep.query
+                        .filter(
+                            WorkflowStep.status == 'pending',
+                            WorkflowStep.scheduled_time <= datetime.utcnow()
+                        )
+                        .with_for_update(skip_locked=True)
+                        .limit(100)
+                        .all()
+                    )
+
+                    for step in steps:
+                        container = FormContainer.query.get(step.container_id)
+                        if not container:
+                            step.status = 'revoked'
+                            continue
+
+                        # Marquage immédiat en processing
+                        step.status = 'processing'
+                        step.locked_at = datetime.utcnow()
+
+                        if step.step_type == 'reminder':
+                            from workflow.tasks.operations.reminder import send_reminder_task
+                            send_reminder_task.apply_async(
+                                args=[step.id, step.form_id, step.container_id, step.step_index]
+                            )
+                        else:
+                            from workflow.tasks.operations.escalate import send_escalate_task
+                            send_escalate_task.apply_async(
+                                args=[step.id, step.form_id, step.container_id]
+                            )
+
+                logger.info(f"Successfully processed {len(steps)} scheduled steps")
+                
             except SQLAlchemyError as e:
-                logger.error(f"Database error in {func.__name__}: {e}")
-                self.retry(exc=e, countdown=retry_delay, max_retries=max_retries)
-            except Exception as e:
-                logger.error(f"Unexpected error in {func.__name__}: {e}")
-                self.retry(exc=e, countdown=retry_delay, max_retries=max_retries)
-        return wrapper
-    return decorator
-
-
-class BaseWorkflowTask(Task):
-    autoretry_for = (Exception,)
-    max_retries = 3
-    retry_backoff = True
-    retry_backoff_max = 600
-    rate_limit = '10/m'
-
-    def _handle_task(self, step_id: str, context: Dict, handler: Callable) -> Dict:
-        # Lock pessimiste + marquage "processing" atomique
-        with db.session.begin():
-            step = db.session.execute(
-                select(WorkflowStep)
-                .where(WorkflowStep.id == step_id)
-                .with_for_update(skip_locked=True)
-            ).scalar_one_or_none()
-
-            if not step:
-                raise RevokeChainRequested("Step not found or locked")
-
-            context.update({'step_id': step_id, 'task_id': self.request.id})
-
-            self._validate_prerequisites(step, context)
-
-            if step.status not in ('processing', 'pending'):
-                raise WorkflowException(
-                    f"Invalid step state: {step.status}",
-                    {'current_status': step.status, **context}
-                )
-
-            # si le scheduler a déjà mis processing, on continue,
-            # sinon on le met maintenant (cas d’appel direct)
-            if step.status == 'pending':
-                step.status = 'processing'
-                step.locked_at = datetime.utcnow()
-
-        try:
-            result = handler(context)
-            self._finalize_step(step_id, 'completed')
-            return result
-        except RevokeChainRequested as e:
-            self._handle_revocation(step_id, context, e)
-            return getattr(e, "return_value", {"status": "revoked", "message": str(e)})
-        except Exception as e:
-            self._handle_retry(step_id, e)
-            raise
-
-    def _validate_prerequisites(self, step: WorkflowStep, context: Dict) -> None:
-        form = Form.query.get(context['form_id'])
-        container = FormContainer.query.get(context['container_id'])
-        if not form or not container:
-            raise RevokeChainRequested("Form or container missing", {'status': 'revoked', **context})
-
-    def _finalize_step(self, step_id: str, status: str) -> None:
-        with db.session.begin():
-            step = db.session.get(WorkflowStep, step_id)
-            if step:
-                step.status = status
-
-    def _handle_revocation(self, step_id: str, context: Dict, error: RevokeChainRequested) -> None:
-        with db.session.begin():
-            step = db.session.get(WorkflowStep, step_id)
-            if step:
-                logger.warning(f"Revoking workflow chain: {error}", extra=context)
-                # on révoque uniquement ce step :
-                step.status = 'revoked'
-
-    def _handle_retry(self, step_id: str, error: Exception) -> None:
-        with db.session.begin():
-            step = db.session.get(WorkflowStep, step_id)
-            if step:
-                step.retries += 1
-                if step.retries >= step.max_retries:
-                    step.status = 'failed'
-                else:
-                    step.status = 'pending'
-                    step.scheduled_time = datetime.utcnow() + timedelta(hours=1)
+                logger.error(f"Database error in step processing: {e}")
+                db.session.rollback()
+                self.retry(countdown=300)
+                
+    except Exception as e:
+        logger.info(f"Could not acquire lock for scheduled steps: {e}")
+        # Ne pas retry - un autre worker traite déjà
+        return {"status": "skipped", "reason": "lock_not_acquired"}
 ```
 
----
-
-# 4) **Fix des tasks “operations”** — bugs concrets
-
-Tu as deux bugs qui provoqueront des erreurs + des emails non conformes :
-
-* Typos/propriétés : `appication` → `application`.
-* Appel de `MailManager.send_email(...)` **mauvais ordre/arguments**.
-  Ta signature est :
-
-  ```python
-  def send_email(form_container, template_type, recipient_email=None, cc_emails=None,
-                 substitutions=None, workflow_step='start'):
-  ```
-
-  → Il faut lui passer **`form_container=`** et **`template_type=`**, pas `mail_sender`/`subject`/`token` en positions.
-
-### `escalate.py` (corrigé)
+### 4. **Configuration finale**
 
 ```python
-# workflow/tasks/operations/escalate.py
-import logging
-from typing import Dict
-from datetime import datetime
-from api.models import FormContainer
-from api.helpers.tools import log_timeline_event
-from workflow.emails.email_manager import MailManager
-from workflow.celery_app import celery_app as app
-from workflow.tasks.core.base import BaseWorkflowTask, workflow_task
+# config.py
+import os
+import socket
 
-logger = logging.getLogger(__name__)
-
-@app.task(base=BaseWorkflowTask, bind=True)
-@workflow_task()
-def send_escalate_task(self, step_id: str, form_id: str, container_id: str) -> Dict:
-    def task_handler(context: Dict) -> Dict:
-        form_container: FormContainer = FormContainer.query.get(context['container_id'])
-
-        # envoi via template "escalate"
-        MailManager.send_email(
-            form_container=form_container,
-            template_type='escalate',
-            recipient_email=form_container.escalade_email,
-            cc_emails=form_container.cc_emails,
-            substitutions={'workflow_reason': 'Escalation Required'},
-            workflow_step='escalate'
-        )
-
-        log_timeline_event(
-            form_container,
-            form_id,
-            datetime.utcnow(),
-            "Escalation triggered",
-            'escalate'
-        )
-        return {'status': 'success', 'escalation': True}
-
-    return self._handle_task(step_id, {
-        'form_id': form_id,
-        'container_id': container_id
-    }, task_handler)
+class Config:
+    # Identification serveur
+    SERVER_ID = os.getenv('SERVER_ID', socket.gethostname())
+    
+    # Redis Configuration
+    REDIS_CLUSTER_MODE = os.getenv('REDIS_CLUSTER_MODE', 'false').lower() == 'true'
+    REDIS_CLUSTER_NODES = [
+        {"host": os.getenv('REDIS_NODE1', 'redis-node1'), "port": 6379},
+        {"host": os.getenv('REDIS_NODE2', 'redis-node2'), "port": 6379},
+        {"host": os.getenv('REDIS_NODE3', 'redis-node3'), "port": 6379},
+    ]
+    REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+    REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
+    
+    # Celery
+    CELERY_BROKER_URL = REDIS_URL
+    CELERY_RESULT_BACKEND = REDIS_URL
+    
+    # RedBeat optionnel
+    REDBEAT_ENABLED = os.getenv('REDBEAT_ENABLED', 'false').lower() == 'true'
+    
+    # Optimisations
+    CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+    CELERY_ACKS_LATE = True
+    CELERY_TASK_REJECT_ON_WORKER_LOST = True
 ```
 
-### `reminder.py` (corrigé)
+### 5. **Initialisation dans l'app Flask**
 
 ```python
-# workflow/tasks/operations/reminder.py
-import logging
-from typing import Dict
-from datetime import datetime
-from api.models import FormContainer
-from api.helpers.tools import log_timeline_event
-from workflow.emails.email_manager import MailManager
-from workflow.celery_app import celery_app as app
-from workflow.tasks.core.base import BaseWorkflowTask, workflow_task
-
-logger = logging.getLogger(__name__)
-
-@app.task(base=BaseWorkflowTask, bind=True)
-@workflow_task()
-def send_reminder_task(self, step_id: str, form_id: str, container_id: str, reminder_count: int) -> Dict:
-    def task_handler(context: Dict) -> Dict:
-        form_container: FormContainer = FormContainer.query.get(context['container_id'])
-
-        MailManager.send_email(
-            form_container=form_container,
-            template_type='reminder',
-            recipient_email=form_container.user_email,
-            cc_emails=form_container.cc_emails,
-            substitutions={'reminder_count': reminder_count},
-            workflow_step='reminder'
-        )
-
-        log_timeline_event(
-            form_container,
-            form_id,
-            datetime.utcnow(),
-            f"Reminder {reminder_count} sent",
-            'reminder'
-        )
-        return {'status': 'success', 'reminder_count': reminder_count}
-
-    return self._handle_task(step_id, {
-        'form_id': form_id,
-        'container_id': container_id,
-        'reminder_count': reminder_count
-    }, task_handler)
-```
-
----
-
-# 5) `email_manager.py` — OK mais deux micro-améliorations
-
-* Sécu : transforme `to`/`cc` en listes filtrées (non-vides).
-* Fail-fast si aucun destinataire.
-
-```python
-# workflow/emails/email_manager.py (ajouts mineurs)
-# ... (le reste inchangé)
-
-        to = (recipient_email or form_container.user_email) or ""
-        cc = cc_emails or form_container.cc_emails or []
-
-        recipients = [to] if isinstance(to, str) and to.strip() else list(filter(None, to or []))
-        cc_list = list({e for e in (cc or []) if e})
-
-        if not recipients:
-            raise ValueError("No recipient email resolved")
-
-        msg = Message(
-            subject=subject,
-            sender=mail_sender,
-            recipients=recipients,
-            cc=cc_list
-        )
-        msg.html = full_html
-        mail.send(msg)
-```
-
----
-
-# 6) PostgreSQL — réglages runtime recommandés
-
-Dans `SQLALCHEMY_ENGINE_OPTIONS` (tu l’as déjà bien amorcé) :
-
-```python
-SQLALCHEMY_ENGINE_OPTIONS = {
-    'pool_size': 20,
-    'max_overflow': 30,
-    'pool_pre_ping': True,
-    'pool_recycle': 3600,
-    # Optionnel : isolation plus stricte si besoin
-    # 'isolation_level': 'READ COMMITTED',  # défaut PG
-}
-```
-
-Et côté PostgreSQL (paramètres serveur) :
-
-* `deadlock_timeout = '1s'`
-* `lock_timeout = '5s'` (si tu veux fail-fast sur locks)
-* Index utiles sur `(status, scheduled_time)` de `WorkflowStep`.
-
----
-
-# 7) Déploiement
-
-* **Workers (N≥2)**, **un seul Beat** (ou **RedBeat** si tu veux N Beats).
-* Backends Flask derrière LB.
-* DB **master/replica** (écritures sur master).
-* Redis/RabbitMQ HA (sentinels/cluster).
-
----
-
-Si tu veux, je te prépare un **diff prêt à coller** (patch unified) pour tes fichiers actuels, ou un **docker-compose** minimal “prod-like” (web + worker x2 + beat + postgres + redis + nginx).
-
-
-
-
-
-
-Parfait 👍 tu veux une archi **multi-serveurs (actif-actif)** avec :
-
-* **2 serveurs** (ou +) où tournent tes workers **et** Beat,
-* **un Redis global en cluster** (ou en Sentinel) qui sert à la fois de broker, backend, et scheduler distribué via **RedBeat**.
-
-Dans ce cas, tout ton code peut rester le même à une exception près : **`celery_app.py` doit être configuré pour RedBeat + Redis cluster**.
-
----
-
-## 🔹 `workflow/celery_app.py` – version actif-actif multi-serveurs
-
-```python
-from datetime import timedelta, datetime
-import logging
-from celery import Celery
-from kombu import Queue, Exchange
-from celery.signals import worker_ready, worker_shutdown
+# api/app.py
+from flask import Flask
 from config import Config
-from api.app import create_app
+from workflow.redis_manager import RedisManager
 
-logger = logging.getLogger(__name__)
-
-def make_celery(flask_app):
-    celery_app = Celery(
-        __name__,
-        broker=Config.CELERY_BROKER_URL,        # Redis cluster ou Sentinel
-        backend=Config.CELERY_RESULT_BACKEND,  # Redis aussi
-        enable_utc=True,
-    )
-
-    # -------------------------
-    #  Configuration global HA
-    # -------------------------
-    celery_app.conf.update(
-        task_acks_late=True,
-        worker_prefetch_multiplier=1,
-        broker_connection_retry_on_startup=True,
-        broker_connection_retry=True,
-        broker_connection_max_retries=100,
-        task_serializer='json',
-        result_serializer='json',
-        accept_content=['json'],
-        result_expires=timedelta(hours=6),
-        worker_send_task_events=True,
-        task_send_sent_event=True,
-    )
-
-    # -------------------------
-    #  RedBeat (Beat distribué)
-    # -------------------------
-    celery_app.conf.beat_scheduler = 'redbeat.RedBeatScheduler'
-    celery_app.conf.redbeat_redis_url = Config.CELERY_BROKER_URL
-    celery_app.conf.redbeat_lock_key = 'redbeat:lock'
-    celery_app.conf.redbeat_key_prefix = 'redbeat:'
-
-    celery_app.conf.beat_schedule = {
-        'process-scheduled-steps': {
-            'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
-            'schedule': timedelta(seconds=300),
-            'options': {'queue': 'beat_tasks'}
-        }
-    }
-
-    # -------------------------
-    #  Queues dédiées
-    # -------------------------
-    default_ex = Exchange('default', type='direct')
-    beat_ex = Exchange('beat', type='direct')
-    high_ex = Exchange('high_priority', type='direct')
-
-    celery_app.conf.task_queues = (
-        Queue('high_priority', high_ex, routing_key='high_priority',
-              queue_arguments={'x-max-priority': 10}),
-        Queue('beat_tasks', beat_ex, routing_key='beat.process'),
-        Queue('default', default_ex, routing_key='default'),
-    )
-
-    celery_app.conf.task_default_queue = 'default'
-    celery_app.conf.task_routes = {
-        'workflow.tasks.core.scheduler.process_scheduled_steps': {'queue': 'beat_tasks'},
-        'workflow.tasks.operations.escalate.send_escalate_task': {'queue': 'high_priority'},
-        'workflow.tasks.operations.reminder.send_reminder_task': {'queue': 'default'},
-    }
-
-    # -------------------------
-    #  Contexte Flask
-    # -------------------------
-    class FlaskContextTask(celery_app.Task):
-        def __call__(self, *args, **kwargs):
-            with flask_app.app_context():
-                return super().__call__(*args, **kwargs)
-
-        def on_failure(self, exc, task_id, args, kwargs, einfo):
-            logger.error(f"Task {task_id} failed: {exc}")
-            return super().on_failure(exc, task_id, args, kwargs, einfo)
-
-    celery_app.Task = FlaskContextTask
-
-    # -------------------------
-    #  Signaux log
-    # -------------------------
-    @worker_ready.connect
-    def worker_ready_handler(sender, **kw):
-        logger.info(f"Worker {sender.hostname} ready")
-
-    @worker_shutdown.connect
-    def worker_shutdown_handler(sender, **kw):
-        logger.info(f"Worker {sender.hostname} shutting down")
-
-    return celery_app
-
-
-flask_app = create_app(Config)
-celery_app = make_celery(flask_app)
-
-@celery_app.task(bind=True)
-def health_check(self):
-    return {
-        "status": "OK",
-        "worker": self.request.hostname,
-        "timestamp": datetime.utcnow().isoformat()
-    }
+def create_app(config_class=Config):
+    app = Flask(__name__)
+    app.config.from_object(config_class)
+    
+    # Extensions existantes
+    from api.extensions import db, mail
+    db.init_app(app)
+    mail.init_app(app)
+    
+    # 🔥 Redis Manager
+    app.redis_manager = RedisManager(config_class)
+    
+    # Blueprints, etc.
+    # ...
+    
+    return app
 ```
 
----
-
-## 🔹  Déploiement sur 2 serveurs (actif-actif)
-
-👉 Tu lances **les mêmes process sur les 2 machines** :
+## 🚀 **Déploiement Actif-Actif**
 
 ```bash
-# Sur les 2 serveurs
-celery -A workflow.celery_app.celery_app worker -Q default,high_priority,beat_tasks -l INFO -n worker@%h
-celery -A workflow.celery_app.celery_app beat -l INFO -s /tmp/celerybeat-schedule
+# Sur le serveur 1
+SERVER_ID=backend-1 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app worker --queues=default,high_priority,beat_tasks -l info -c 4
+SERVER_ID=backend-1 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app beat -l info
+
+# Sur le serveur 2  
+SERVER_ID=backend-2 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app worker --queues=default,high_priority,beat_tasks -l info -c 4
+SERVER_ID=backend-2 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app beat -l info
 ```
 
-* Grâce à **RedBeat**, les 2 Beat vont se coordonner → un seul exécute le job toutes les 5 min, l’autre est standby.
-* Grâce à Redis cluster, si un nœud tombe, tout continue.
-* Les workers consomment en parallèle sans doublons (grâce à `with_for_update(skip_locked)` dans tes tasks DB).
+## ✅ **Avantages de cette solution**
 
----
+1. **🎯 RedisManager unique** : Abstraction complète pour standalone et cluster
+2. **🔥 Utilise redis-py natif** : Pas de code maison, robuste et maintenable
+3. **🚀 Fonctionnalités Redis 8.2.2** : JSON, ZRANDMEMBER, etc.
+4. **🔒 Locks distribués** : Coordination actif-actif fiable
+5. **❤️ Health checks** : Monitoring complet du cluster
+6. **📈 Scalable** : Ajout facile de nouveaux serveurs
+7. **🐛 Debuggable** : Logging complet et gestion d'erreurs
 
-## 🔹 Avantages
-
-✅ **Pas de SPOF Beat** → tu peux lancer un Beat sur chaque serveur.
-✅ **Redis cluster global** → broker + backend + Beat distribué, robuste.
-✅ **Workers scalables** → chaque serveur peut en héberger plusieurs.
-✅ **DB sûre** → `skip_locked` évite les doublons.
-
----
-
-Veux-tu que je te prépare un **docker-compose multi-nodes** (2 serveurs simulés, 1 Redis cluster, Celery workers + Beat) pour que tu testes l’archi avant de passer en infra réelle ?
+Cette architecture combine le meilleur des deux approches avec une gestion Redis professionnelle ! 🎉

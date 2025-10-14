@@ -1,0 +1,883 @@
+Pour gérer l'authentification server-to-server via Apigee avec des tokens JWT, voici une solution complète qui s'intègre avec votre système existant :
+
+## 🔧 **1. Amélioration du système d'authentification**
+
+```python
+# api/auth/middleware.py
+import jwt
+from flask import request, jsonify, abort, current_app
+from functools import wraps
+from api.models import Application, APIToken
+from config import Config
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AuthManager:
+    """Gestionnaire centralisé d'authentification pour tous les types de tokens"""
+
+    def __init__(self):
+        self.token_types = {
+            'user': self._validate_user_token,
+            'api': self._validate_api_token,
+            'server': self._validate_server_token
+        }
+
+    def authenticate_request(self):
+        """
+        Middleware principal qui gère tous les types de tokens
+        """
+        if request.method == 'OPTIONS':
+            return
+
+        try:
+            auth_header = request.headers.get('Authorization')
+            if not auth_header:
+                return jsonify({"error": "Authorization header required"}), 401
+
+            token = self._extract_token(auth_header)
+            if not token:
+                return jsonify({"error": "Invalid authorization format"}), 401
+
+            # Décodage du token pour identifier le type
+            decoded_token = self._decode_token(token)
+            if not decoded_token:
+                return jsonify({"error": "Invalid token"}), 401
+
+            # Identification du type de token et validation
+            token_type = self._identify_token_type(decoded_token)
+            validation_method = self.token_types.get(token_type)
+
+            if not validation_method:
+                return jsonify({"error": "Unsupported token type"}), 401
+
+            return validation_method(token, decoded_token)
+
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            return jsonify({"error": "Authentication failed", "details": str(e)}), 401
+
+    def _extract_token(self, auth_header):
+        """Extrait le token de l'en-tête Authorization"""
+        parts = auth_header.split()
+        if len(parts) == 2 and parts[0].lower() == 'bearer':
+            return parts[1]
+        elif len(parts) == 1:
+            return parts[0]  # Format personnalisé sans 'Bearer'
+        return None
+
+    def _decode_token(self, token):
+        """Décodage basique du token JWT"""
+        try:
+            return jwt.decode(token, Config.SECRET_KEY, algorithms=['HS256'], options={"verify_exp": True})
+        except jwt.ExpiredSignatureError:
+            raise Exception("Token expired")
+        except jwt.InvalidTokenError as e:
+            raise Exception(f"Invalid token: {e}")
+
+    def _identify_token_type(self, decoded_token):
+        """Identifie le type de token basé sur son contenu"""
+        if "app_names" in decoded_token and "token_type" in decoded_token:
+            return decoded_token.get("token_type")  # 'api' ou 'server'
+        elif "sub" in decoded_token:
+            return "user"
+        else:
+            raise Exception("Unknown token type")
+
+    def _validate_user_token(self, token, decoded_token):
+        """Validation des tokens utilisateur standards"""
+        request.user_id = decoded_token["sub"]
+        request.app_names = None
+        request.token_type = "user"
+        request.token_permissions = {"read": True, "write": True}  # Par défaut pour les users
+
+    def _validate_api_token(self, token, decoded_token):
+        """Validation des tokens API existants"""
+        token_entry = APIToken.query.filter_by(token=token).first()
+        if not token_entry or not token_entry.is_active:
+            raise Exception("API token revoked or invalid")
+
+        request.app_names = decoded_token["app_names"]
+        request.user_id = decoded_token.get("token_name")
+        request.token_type = "api"
+        request.token_permissions = getattr(token_entry, 'permissions', {"read": True, "write": False})
+
+    def _validate_server_token(self, token, decoded_token):
+        """
+        Validation des tokens server-to-server pour Apigee
+        Structure attendue:
+        {
+            "token_type": "server",
+            "client_id": "apigee-client-1",
+            "app_names": ["app1", "app2"],
+            "permissions": ["read", "write"],
+            "scope": "api:read api:write",
+            "exp": 1234567890
+        }
+        """
+        # Vérification des champs obligatoires
+        required_fields = ["client_id", "app_names", "permissions"]
+        for field in required_fields:
+            if field not in decoded_token:
+                raise Exception(f"Missing required field: {field}")
+
+        # Vérification que le client est autorisé
+        client_id = decoded_token["client_id"]
+        if not self._is_authorized_client(client_id):
+            raise Exception(f"Unauthorized client: {client_id}")
+
+        # Vérification que les applications existent
+        app_names = decoded_token["app_names"]
+        valid_apps = Application.query.filter(Application.name.in_(app_names)).all()
+        if len(valid_apps) != len(app_names):
+            invalid_apps = set(app_names) - {app.name for app in valid_apps}
+            raise Exception(f"Invalid applications: {', '.join(invalid_apps)}")
+
+        # Stockage dans le contexte de la requête
+        request.app_names = app_names
+        request.user_id = client_id
+        request.token_type = "server"
+        request.token_permissions = {
+            "read": "read" in decoded_token["permissions"],
+            "write": "write" in decoded_token["permissions"],
+            "scope": decoded_token.get("scope", "").split()
+        }
+        request.client_id = client_id
+
+    def _is_authorized_client(self, client_id):
+        """Vérifie si le client est autorisé (peut être basé sur une whitelist)"""
+        authorized_clients = getattr(Config, 'AUTHORIZED_SERVER_CLIENTS', [])
+        return client_id in authorized_clients
+
+# Instance globale
+auth_manager = AuthManager()
+
+# Middleware principal
+def authenticate_request():
+    return auth_manager.authenticate_request()
+
+# Décorateurs spécialisés
+def require_user_token(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if getattr(request, 'token_type', None) != "user":
+            return jsonify({"error": "Access denied. User token required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+def require_api_token(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token_type = getattr(request, 'token_type', None)
+        if token_type not in ["api", "server"]:
+            return jsonify({"error": "Access denied. API or Server token required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+def require_server_token(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if getattr(request, 'token_type', None) != "server":
+            return jsonify({"error": "Access denied. Server token required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+def require_permission(permission):
+    """Décorateur pour vérifier des permissions spécifiques"""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            token_permissions = getattr(request, 'token_permissions', {})
+
+            if permission == "read" and not token_permissions.get("read", False):
+                return jsonify({"error": "Read permission required"}), 403
+            elif permission == "write" and not token_permissions.get("write", False):
+                return jsonify({"error": "Write permission required"}), 403
+            elif permission == "admin" and not token_permissions.get("admin", False):
+                return jsonify({"error": "Admin permission required"}), 403
+
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def require_valid_app_ids(param_name=None, allow_multiple=True, source="kwargs", permission="read"):
+    """
+    Version améliorée avec gestion des permissions
+    """
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            # Vérification de base de l'authentification
+            auth_result = authenticate_request()
+            if auth_result:
+                return auth_result
+
+            app_names = getattr(request, 'app_names', None)
+            token_permissions = getattr(request, 'token_permissions', {})
+
+            # Vérification de la permission
+            if permission == "write" and not token_permissions.get("write", False):
+                return jsonify({"error": "Write permission required for this operation"}), 403
+
+            if app_names:
+                # Extraction des app_ids selon la source
+                if source == "kwargs":
+                    app_ids = kwargs.get(param_name)
+                elif source == "args":
+                    app_ids = request.args.get(param_name)
+                elif source == "json":
+                    data = request.get_json(silent=True) or {}
+                    app_ids = data.get(param_name)
+                else:
+                    return abort(400, {"error": f"Invalid source: {source}"})
+
+                if not app_ids:
+                    return abort(400, {"error": f"{param_name} is required"})
+
+                # Conversion en liste si multiple autorisé
+                app_id_list = app_ids.split(',') if allow_multiple and isinstance(app_ids, str) else [app_ids]
+
+                # Récupération des applications autorisées
+                valid_apps = Application.query.filter(Application.name.in_(app_names)).all()
+                valid_app_ids = [str(app.id) for app in valid_apps]
+
+                # Vérification des accès
+                invalid_app_ids = [app_id for app_id in app_id_list if app_id not in valid_app_ids]
+
+                if invalid_app_ids:
+                    return jsonify({
+                        "error": f"Unauthorized access to applications",
+                        "unauthorized_apps": invalid_app_ids,
+                        "authorized_apps": valid_app_ids
+                    }), 403
+
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+```
+
+## 🔑 **2. Générateur de tokens server-to-server**
+
+```python
+# api/auth/token_generator.py
+import jwt
+from datetime import datetime, timedelta
+from config import Config
+from api.models import Application, db
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ServerTokenGenerator:
+    """Générateur de tokens JWT pour l'authentification server-to-server"""
+
+    def __init__(self):
+        self.secret_key = Config.SECRET_KEY
+        self.algorithm = 'HS256'
+
+    def generate_server_token(self, client_id, app_names, permissions=None, expires_in=3600, scope=None):
+        """
+        Génère un token JWT pour l'authentification server-to-server
+
+        Args:
+            client_id (str): Identifiant unique du client
+            app_names (list): Liste des noms d'applications autorisées
+            permissions (list): Liste des permissions ['read', 'write', 'admin']
+            expires_in (int): Durée de validité en secondes
+            scope (str): Scope OAuth2 optionnel
+
+        Returns:
+            str: Token JWT signé
+        """
+        try:
+            # Validation des applications
+            valid_apps = Application.query.filter(Application.name.in_(app_names)).all()
+            if len(valid_apps) != len(app_names):
+                invalid_apps = set(app_names) - {app.name for app in valid_apps}
+                raise ValueError(f"Invalid applications: {', '.join(invalid_apps)}")
+
+            # Payload du token
+            payload = {
+                "token_type": "server",
+                "client_id": client_id,
+                "app_names": app_names,
+                "permissions": permissions or ["read"],
+                "scope": scope or "api:read",
+                "exp": datetime.utcnow() + timedelta(seconds=expires_in),
+                "iat": datetime.utcnow()
+            }
+
+            # Génération du token
+            token = jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
+
+            logger.info(f"Generated server token for client {client_id} with apps {app_names}")
+            return token
+
+        except Exception as e:
+            logger.error(f"Error generating server token: {e}")
+            raise
+
+    def verify_server_token(self, token):
+        """
+        Vérifie la validité d'un token server
+        """
+        try:
+            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+
+            if payload.get("token_type") != "server":
+                raise ValueError("Not a server token")
+
+            return payload
+
+        except jwt.ExpiredSignatureError:
+            raise ValueError("Token expired")
+        except jwt.InvalidTokenError as e:
+            raise ValueError(f"Invalid token: {e}")
+
+    def refresh_token(self, token, expires_in=3600):
+        """
+        Rafraîchit un token existant
+        """
+        try:
+            payload = self.verify_server_token(token)
+
+            # Régénère avec les mêmes paramètres mais nouvelle expiration
+            new_payload = payload.copy()
+            new_payload["exp"] = datetime.utcnow() + timedelta(seconds=expires_in)
+            new_payload["iat"] = datetime.utcnow()
+
+            return jwt.encode(new_payload, self.secret_key, algorithm=self.algorithm)
+
+        except Exception as e:
+            logger.error(f"Error refreshing token: {e}")
+            raise
+
+# Instance globale
+token_generator = ServerTokenGenerator()
+```
+
+## 🌐 **3. Endpoints pour la gestion des tokens server**
+
+```python
+# api/routes/server_auth.py
+from flask import Blueprint, request, jsonify, current_app
+from api.auth.token_generator import token_generator
+from api.auth.middleware import require_server_token, require_permission
+from api.models import Application, db
+import logging
+
+logger = logging.getLogger(__name__)
+
+server_auth_bp = Blueprint('server_auth', __name__, url_prefix='/api/v1/server-auth')
+
+@server_auth_bp.route('/token', methods=['POST'])
+@require_server_token
+@require_permission("admin")  # Seuls les tokens avec permission admin peuvent générer des tokens
+def generate_server_token():
+    """
+    Endpoint pour générer de nouveaux tokens server-to-server
+    """
+    try:
+        data = request.get_json()
+
+        # Validation des données
+        required_fields = ['client_id', 'app_names']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+
+        client_id = data['client_id']
+        app_names = data['app_names']
+        permissions = data.get('permissions', ['read'])
+        expires_in = data.get('expires_in', 3600)
+        scope = data.get('scope', 'api:read')
+
+        # Génération du token
+        token = token_generator.generate_server_token(
+            client_id=client_id,
+            app_names=app_names,
+            permissions=permissions,
+            expires_in=expires_in,
+            scope=scope
+        )
+
+        return jsonify({
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+            "scope": scope,
+            "client_id": client_id,
+            "authorized_apps": app_names
+        })
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error generating server token: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@server_auth_bp.route('/token/verify', methods=['POST'])
+def verify_token():
+    """
+    Endpoint pour vérifier la validité d'un token
+    """
+    try:
+        data = request.get_json()
+        token = data.get('token')
+
+        if not token:
+            return jsonify({"error": "Token is required"}), 400
+
+        payload = token_generator.verify_server_token(token)
+
+        return jsonify({
+            "valid": True,
+            "client_id": payload.get("client_id"),
+            "app_names": payload.get("app_names"),
+            "permissions": payload.get("permissions"),
+            "expires_at": payload.get("exp")
+        })
+
+    except ValueError as e:
+        return jsonify({"valid": False, "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error verifying token: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@server_auth_bp.route('/applications', methods=['GET'])
+@require_server_token
+@require_permission("read")
+def list_authorized_applications():
+    """
+    Endpoint pour lister les applications accessibles par le token
+    """
+    try:
+        app_names = getattr(request, 'app_names', [])
+
+        applications = Application.query.filter(Application.name.in_(app_names)).all()
+
+        app_list = [{
+            "id": app.id,
+            "name": app.name,
+            "description": app.description,
+            "created_at": app.created_at.isoformat() if app.created_at else None
+        } for app in applications]
+
+        return jsonify({
+            "applications": app_list,
+            "count": len(app_list)
+        })
+
+    except Exception as e:
+        logger.error(f"Error listing applications: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+```
+
+## ⚙️ **4. Configuration pour Apigee**
+
+```python
+# config.py - Ajouts pour l'authentification server
+class Config:
+    # ... configuration existante ...
+
+    # Authentification server-to-server
+    AUTHORIZED_SERVER_CLIENTS = [
+        "apigee-gateway",
+        "internal-service-1",
+        "data-processor",
+        "reporting-service"
+    ]
+
+    # Durées de validité des tokens (en secondes)
+    SERVER_TOKEN_EXPIRY = 3600  # 1 heure
+    SERVER_TOKEN_REFRESH_BUFFER = 300  # 5 minutes pour le rafraîchissement
+
+    # Permissions par défaut
+    DEFAULT_SERVER_PERMISSIONS = ["read"]
+```
+
+## 🛡️ **5. Exemples d'utilisation dans les routes**
+
+```python
+# Exemples d'utilisation des décorateurs
+
+# Route accessible uniquement par les tokens server avec permission read
+@bp.route('/api/data/<app_id>', methods=['GET'])
+@require_server_token
+@require_permission("read")
+@require_valid_app_ids(param_name='app_id', source='kwargs', permission='read')
+def get_application_data(app_id):
+    """Récupère les données d'une application spécifique"""
+    # Seuls les tokens server avec accès à cette app_id peuvent accéder
+    app = Application.query.get_or_404(app_id)
+    return jsonify({"data": "sensitive_data", "app": app.name})
+
+# Route accessible par tous les tokens avec permission write
+@bp.route('/api/data/<app_id>', methods=['POST'])
+@require_api_token  # Accepte à la fois les tokens API et Server
+@require_permission("write")
+@require_valid_app_ids(param_name='app_id', source='kwargs', permission='write')
+def update_application_data(app_id):
+    """Met à jour les données d'une application"""
+    data = request.get_json()
+    # Logique de mise à jour...
+    return jsonify({"status": "updated", "app_id": app_id})
+
+# Route accessible uniquement par les tokens server admin
+@bp.route('/api/admin/operations', methods=['POST'])
+@require_server_token
+@require_permission("admin")
+def admin_operation():
+    """Opération d'administration réservée aux serveurs"""
+    data = request.get_json()
+    # Logique admin...
+    return jsonify({"status": "admin_operation_completed"})
+```
+
+## 📋 **6. Structure des tokens JWT**
+
+### Token Server typique :
+```json
+{
+  "token_type": "server",
+  "client_id": "apigee-gateway",
+  "app_names": ["app1", "app2", "app3"],
+  "permissions": ["read", "write"],
+  "scope": "api:read api:write",
+  "exp": 1735689600,
+  "iat": 1735686000
+}
+```
+
+### Token API existant (rétrocompatible) :
+```json
+{
+  "token_type": "api",
+  "app_names": ["app1"],
+  "token_name": "mon-token-api",
+  "exp": 1735689600
+}
+```
+
+### Token Utilisateur :
+```json
+{
+  "sub": "user123",
+  "exp": 1735689600
+}
+```
+
+## 🚀 **7. Utilisation avec Apigee**
+
+Pour Apigee, vous pouvez maintenant :
+
+1. **Générer des tokens** via l'endpoint `/api/v1/server-auth/token`
+2. **Vérifier les tokens** via `/api/v1/server-auth/token/verify`
+3. **Utiliser les tokens** dans les headers Authorization
+4. **Contrôler finement les accès** par application et permission
+
+Cette solution offre :
+- ✅ **Rétrocompatibilité** avec votre système existant
+- ✅ **Sécurité renforcée** avec différents types de tokens
+- ✅ **Contrôle d'accès granulaire** par application et permission
+- ✅ **Gestion centralisée** de l'authentification
+- ✅ **Intégration Apigee** optimale
+- ✅ **Logs et monitoring** complets
+
+
+
+
+
+
+
+
+
+
+
+
+
+Excellente décision 🔥 — passer à un identifiant **`app_uuid`** est la bonne approche pour sécuriser et stabiliser ton système d’authentification (et éviter que les renommages d’applications ne cassent les tokens).
+
+Voici une version **améliorée et modernisée** de ton `middleware.py`, entièrement compatible avec les UUID et prête pour la production.
+Je t’explique d’abord les changements clés, puis je te donne le code complet prêt à copier.
+
+---
+
+## ⚙️ **Principaux changements apportés**
+
+| Type d’amélioration                | Description                                                                                                   |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| ✅ **Migration vers `app_uuid`**    | Remplacement complet de `app_names` par `app_uuids` (identifiant immuable)                                    |
+| ✅ **Rétrocompatibilité**           | Si un token plus ancien contient `app_names`, le système mappe automatiquement vers les `uuid` correspondants |
+| ✅ **Vérification robuste**         | Les accès sont vérifiés en base via `Application.uuid`, pas `name`                                            |
+| ✅ **Clarté du code**               | Regroupement des fonctions, factorisation des vérifications et logs plus précis                               |
+| ✅ **Préparation Apigee**           | Compatible avec des tokens server-to-server signés par Apigee contenant `app_uuid` et `client_id`             |
+| ✅ **Messages d’erreur explicites** | Toutes les erreurs retournent un JSON clair et logué                                                          |
+
+---
+
+## 🧩 **Code complet `api/auth/middleware.py`**
+
+```python
+import jwt
+import logging
+from flask import request, jsonify, abort
+from functools import wraps
+from api.models import Application, APIToken
+from config import Config
+
+logger = logging.getLogger(__name__)
+
+
+class AuthManager:
+    """Central authentication manager for user, API, and server tokens."""
+
+    def __init__(self):
+        self.token_types = {
+            'user': self._validate_user_token,
+            'api': self._validate_api_token,
+            'server': self._validate_server_token
+        }
+
+    def authenticate_request(self):
+        """Main middleware handling all token types."""
+        if request.method == 'OPTIONS':
+            return
+
+        try:
+            auth_header = request.headers.get('Authorization')
+            if not auth_header:
+                return jsonify({"error": "Authorization header required"}), 401
+
+            token = self._extract_token(auth_header)
+            if not token:
+                return jsonify({"error": "Invalid authorization format"}), 401
+
+            decoded_token = self._decode_token(token)
+            token_type = self._identify_token_type(decoded_token)
+
+            validation_method = self.token_types.get(token_type)
+            if not validation_method:
+                return jsonify({"error": f"Unsupported token type: {token_type}"}), 401
+
+            return validation_method(token, decoded_token)
+
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            return jsonify({"error": "Authentication failed", "details": str(e)}), 401
+
+    # ------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------
+
+    def _extract_token(self, auth_header):
+        """Extracts Bearer or raw token from header."""
+        parts = auth_header.split()
+        if len(parts) == 2 and parts[0].lower() == 'bearer':
+            return parts[1]
+        elif len(parts) == 1:
+            return parts[0]
+        return None
+
+    def _decode_token(self, token):
+        """Decode a JWT using the configured secret key."""
+        try:
+            return jwt.decode(token, Config.SECRET_KEY, algorithms=['HS256'], options={"verify_exp": True})
+        except jwt.ExpiredSignatureError:
+            raise Exception("Token expired")
+        except jwt.InvalidTokenError as e:
+            raise Exception(f"Invalid token: {e}")
+
+    def _identify_token_type(self, decoded_token):
+        """Determine token type based on its payload content."""
+        if "token_type" in decoded_token:
+            return decoded_token.get("token_type")
+        elif "sub" in decoded_token:
+            return "user"
+        else:
+            raise Exception("Unknown token type")
+
+    # ------------------------------------------------------------
+    # Token Validators
+    # ------------------------------------------------------------
+
+    def _validate_user_token(self, token, decoded_token):
+        """Validate standard user tokens."""
+        request.user_id = decoded_token["sub"]
+        request.app_uuids = None
+        request.token_type = "user"
+        request.token_permissions = {"read": True, "write": True}
+        logger.debug(f"User token validated for user_id={request.user_id}")
+
+    def _validate_api_token(self, token, decoded_token):
+        """Validate internal API tokens."""
+        token_entry = APIToken.query.filter_by(token=token).first()
+        if not token_entry or not token_entry.is_active:
+            raise Exception("API token revoked or invalid")
+
+        app_uuids = decoded_token.get("app_uuids")
+        if not app_uuids and decoded_token.get("app_names"):
+            # rétrocompatibilité
+            app_uuids = [
+                app.uuid for app in Application.query.filter(
+                    Application.name.in_(decoded_token["app_names"])
+                ).all()
+            ]
+
+        request.app_uuids = app_uuids
+        request.user_id = decoded_token.get("token_name")
+        request.token_type = "api"
+        request.token_permissions = getattr(token_entry, 'permissions', {"read": True, "write": False})
+        logger.debug(f"API token validated for user={request.user_id}, apps={app_uuids}")
+
+    def _validate_server_token(self, token, decoded_token):
+        """Validate server-to-server tokens (Apigee, internal services)."""
+        required_fields = ["client_id", "permissions"]
+        for field in required_fields:
+            if field not in decoded_token:
+                raise Exception(f"Missing required field: {field}")
+
+        client_id = decoded_token["client_id"]
+        if not self._is_authorized_client(client_id):
+            raise Exception(f"Unauthorized client: {client_id}")
+
+        app_uuids = decoded_token.get("app_uuids")
+        if not app_uuids:
+            raise Exception("Missing 'app_uuids' in token")
+
+        valid_apps = Application.query.filter(Application.uuid.in_(app_uuids)).all()
+        if len(valid_apps) != len(app_uuids):
+            invalid = set(app_uuids) - {a.uuid for a in valid_apps}
+            raise Exception(f"Invalid application UUIDs: {', '.join(invalid)}")
+
+        # Store in request context
+        request.app_uuids = app_uuids
+        request.user_id = client_id
+        request.client_id = client_id
+        request.token_type = "server"
+        request.token_permissions = {
+            "read": "read" in decoded_token["permissions"],
+            "write": "write" in decoded_token["permissions"],
+            "admin": "admin" in decoded_token["permissions"],
+            "scope": decoded_token.get("scope", "").split()
+        }
+        logger.debug(f"Server token validated for client={client_id}, apps={app_uuids}")
+
+    def _is_authorized_client(self, client_id):
+        """Check if the client is authorized based on config whitelist."""
+        authorized_clients = getattr(Config, 'AUTHORIZED_SERVER_CLIENTS', [])
+        return client_id in authorized_clients
+
+
+# ------------------------------------------------------------
+# Global instance and decorators
+# ------------------------------------------------------------
+
+auth_manager = AuthManager()
+
+
+def authenticate_request():
+    return auth_manager.authenticate_request()
+
+
+def require_user_token(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if getattr(request, 'token_type', None) != "user":
+            return jsonify({"error": "Access denied. User token required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_api_token(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        token_type = getattr(request, 'token_type', None)
+        if token_type not in ["api", "server"]:
+            return jsonify({"error": "Access denied. API or Server token required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_server_token(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if getattr(request, 'token_type', None) != "server":
+            return jsonify({"error": "Access denied. Server token required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_permission(permission):
+    """Decorator to check specific permissions like read/write/admin."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            perms = getattr(request, 'token_permissions', {})
+            if not perms.get(permission, False):
+                return jsonify({"error": f"{permission.capitalize()} permission required"}), 403
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def require_valid_app_uuids(param_name=None, allow_multiple=True, source="kwargs", permission="read"):
+    """Check that the app UUID(s) in request match authorized ones."""
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            auth_result = authenticate_request()
+            if auth_result:
+                return auth_result
+
+            app_uuids = getattr(request, 'app_uuids', None)
+            perms = getattr(request, 'token_permissions', {})
+
+            if permission == "write" and not perms.get("write", False):
+                return jsonify({"error": "Write permission required for this operation"}), 403
+
+            if app_uuids:
+                if source == "kwargs":
+                    param_value = kwargs.get(param_name)
+                elif source == "args":
+                    param_value = request.args.get(param_name)
+                elif source == "json":
+                    data = request.get_json(silent=True) or {}
+                    param_value = data.get(param_name)
+                else:
+                    return abort(400, {"error": f"Invalid source: {source}"})
+
+                if not param_value:
+                    return abort(400, {"error": f"{param_name} is required"})
+
+                param_list = param_value.split(',') if allow_multiple and isinstance(param_value, str) else [param_value]
+
+                invalid = [pid for pid in param_list if pid not in app_uuids]
+                if invalid:
+                    return jsonify({
+                        "error": "Unauthorized access to applications",
+                        "unauthorized_apps": invalid,
+                        "authorized_apps": app_uuids
+                    }), 403
+
+            return f(*args, **kwargs)
+        return wrapper
+    return decorator
+```
+
+---
+
+## 🧠 **Résumé des avantages**
+
+| Catégorie        | Détail                                                                  |
+| ---------------- | ----------------------------------------------------------------------- |
+| 🔒 Sécurité      | Validation par UUID immuable                                            |
+| 🧩 Compatibilité | Support automatique pour anciens tokens (`app_names`)                   |
+| 🧰 Maintenance   | Code clair, factorisé et compatible Apigee                              |
+| 🔄 Extensibilité | Ajout facile de nouveaux types de tokens (`internal`, `external`, etc.) |
+| 🪶 Légèreté      | Aucune dépendance supplémentaire, tout est géré dans le middleware      |
+
+---
+
+Souhaites-tu que je t’ajoute le **modèle SQLAlchemy mis à jour (`Application`)** et la **migration Alembic** correspondante pour inclure `uuid` + mise à jour automatique des anciennes données (`app.name → app.uuid` dans la base) ?
+Ainsi, ton middleware et ta base seraient totalement synchronisés.
