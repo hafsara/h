@@ -1,306 +1,3 @@
-Parfait ! Je vais combiner les deux solutions en une architecture **actif-actif robuste** avec une classe `RedisManager` professionnelle. Voici la solution complète :
-
-## 🎯 **Solution Finale - Architecture Actif-Active**
-
-### 1. **Classe RedisManager complète** (nouveau fichier)
-
-```python
-# workflow/redis_manager.py
-import redis
-from redis.cluster import RedisCluster
-from datetime import timedelta, datetime
-import logging
-import uuid
-import time
-from contextlib import contextmanager
-from typing import Optional, List, Dict, Any
-
-logger = logging.getLogger(__name__)
-
-class RedisManager:
-    """
-    Manager Redis unique pour standalone et cluster
-    Utilise les fonctionnalités natives de redis-py
-    """
-    
-    def __init__(self, config):
-        self.config = config
-        self._client = None
-        self._cluster_mode = getattr(config, 'REDIS_CLUSTER_MODE', False)
-    
-    @property
-    def client(self):
-        """Client Redis lazy-loaded"""
-        if self._client is None:
-            self._client = self._create_client()
-        return self._client
-    
-    def _create_client(self):
-        """Crée le client Redis selon le mode"""
-        try:
-            if self._cluster_mode:
-                logger.info("Initializing Redis Cluster client")
-                return RedisCluster(
-                    startup_nodes=getattr(self.config, 'REDIS_CLUSTER_NODES', []),
-                    decode_responses=True,
-                    skip_full_coverage_check=True,
-                    password=getattr(self.config, 'REDIS_PASSWORD', None),
-                    socket_connect_timeout=5,
-                    socket_timeout=5,
-                    retry_on_timeout=True,
-                    max_connections=50
-                )
-            else:
-                logger.info("Initializing Redis Standalone client")
-                return redis.from_url(
-                    getattr(self.config, 'REDIS_URL', 'redis://localhost:6379/0'),
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=5,
-                    retry_on_timeout=True,
-                    max_connections=50
-                )
-        except Exception as e:
-            logger.error(f"Failed to create Redis client: {e}")
-            raise
-    
-    # 🔥 OPÉRATIONS DE BASE (compatibles cluster)
-    def setex(self, key: str, ttl: timedelta, value: str) -> bool:
-        """SETEX avec gestion d'erreurs"""
-        try:
-            return self.client.setex(key, int(ttl.total_seconds()), value)
-        except Exception as e:
-            logger.error(f"Redis SETEX error for key {key}: {e}")
-            raise
-    
-    def get(self, key: str) -> Optional[str]:
-        """GET avec gestion d'erreurs"""
-        try:
-            return self.client.get(key)
-        except Exception as e:
-            logger.error(f"Redis GET error for key {key}: {e}")
-            return None
-    
-    def keys(self, pattern: str) -> List[str]:
-        """KEYS avec fallback sur SCAN pour les clusters"""
-        try:
-            if self._cluster_mode:
-                # SCAN plus safe en cluster
-                keys = []
-                cursor = 0
-                while True:
-                    cursor, found_keys = self.client.scan(
-                        cursor=cursor, 
-                        match=pattern, 
-                        count=100
-                    )
-                    keys.extend(found_keys)
-                    if cursor == 0:
-                        break
-                return keys
-            else:
-                return self.client.keys(pattern)
-        except Exception as e:
-            logger.error(f"Redis KEYS/SCAN error for pattern {pattern}: {e}")
-            return []
-    
-    def xadd(self, stream: str, fields: Dict[str, Any], maxlen: Optional[int] = None) -> str:
-        """XADD avec truncation optionnelle"""
-        try:
-            kwargs = {}
-            if maxlen:
-                kwargs['maxlen'] = maxlen
-                kwargs['approximate'] = True
-            
-            return self.client.xadd(stream, fields, **kwargs)
-        except Exception as e:
-            logger.error(f"Redis XADD error for stream {stream}: {e}")
-            raise
-    
-    def xdel(self, stream: str, *message_ids: str) -> int:
-        """XDEL pour supprimer des messages de stream"""
-        try:
-            return self.client.xdel(stream, *message_ids)
-        except Exception as e:
-            logger.error(f"Redis XDEL error for stream {stream}: {e}")
-            return 0
-    
-    def xrange(self, stream: str, start: str = '-', end: str = '+', count: Optional[int] = None) -> List:
-        """XRANGE pour lire un stream"""
-        try:
-            return self.client.xrange(stream, min=start, max=end, count=count)
-        except Exception as e:
-            logger.error(f"Redis XRANGE error for stream {stream}: {e}")
-            return []
-    
-    # 🔥 FONCTIONNALITÉS AVANCÉES Redis 8.2.2
-    def json_set(self, key: str, path: str, obj: Any, ttl: Optional[timedelta] = None) -> bool:
-        """JSON.SET avec expiration optionnelle (Redis 8.2.2+)"""
-        try:
-            if hasattr(self.client, 'json_set'):
-                result = self.client.json_set(key, path, obj)
-                if result and ttl:
-                    self.client.expire(key, int(ttl.total_seconds()))
-                return result
-            else:
-                # Fallback si JSON non disponible
-                import json
-                result = self.client.set(key, json.dumps(obj))
-                if result and ttl:
-                    self.client.expire(key, int(ttl.total_seconds()))
-                return result
-        except Exception as e:
-            logger.error(f"Redis JSON.SET error for key {key}: {e}")
-            return False
-    
-    def json_get(self, key: str, path: str = '.') -> Optional[Any]:
-        """JSON.GET (Redis 8.2.2+)"""
-        try:
-            if hasattr(self.client, 'json_get'):
-                return self.client.json_get(key, path)
-            else:
-                # Fallback
-                import json
-                data = self.client.get(key)
-                return json.loads(data) if data else None
-        except Exception as e:
-            logger.error(f"Redis JSON.GET error for key {key}: {e}")
-            return None
-    
-    def zrandmember(self, key: str, count: int = 1) -> List[str]:
-        """ZRANDMEMBRE (Redis 8.2.2+)"""
-        try:
-            if hasattr(self.client, 'zrandmember'):
-                return self.client.zrandmember(key, count)
-            else:
-                # Fallback avec ZRANGE + random
-                import random
-                members = self.client.zrange(key, 0, -1)
-                return random.sample(members, min(count, len(members))) if members else []
-        except Exception as e:
-            logger.error(f"Redis ZRANDMEMBER error for key {key}: {e}")
-            return []
-    
-    # 🔥 LOCKS DISTRIBUÉS POUR ACTIF-ACTIF
-    def acquire_lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10) -> Optional[str]:
-        """Acquire a distributed lock with token"""
-        identifier = str(uuid.uuid4())
-        lock_key = f"lock:{lock_name}"
-        end_time = time.time() + acquire_timeout
-        
-        while time.time() < end_time:
-            try:
-                if self.client.set(lock_key, identifier, ex=timeout, nx=True):
-                    return identifier
-                time.sleep(0.1)  # 100ms
-            except Exception as e:
-                logger.error(f"Redis lock acquisition error for {lock_name}: {e}")
-                break
-        
-        return None
-    
-    def release_lock(self, lock_name: str, identifier: str) -> bool:
-        """Release lock only if owned by current process"""
-        lock_key = f"lock:{lock_name}"
-        
-        lua_script = """
-            if redis.call("GET", KEYS[1]) == ARGV[1] then
-                return redis.call("DEL", KEYS[1])
-            else
-                return 0
-            end
-        """
-        
-        try:
-            release_script = self.client.register_script(lua_script)
-            result = release_script(keys=[lock_key], args=[identifier])
-            return result == 1
-        except Exception as e:
-            logger.error(f"Redis lock release error for {lock_name}: {e}")
-            return False
-    
-    @contextmanager
-    def lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10):
-        """Context manager for distributed locks"""
-        identifier = self.acquire_lock(lock_name, timeout, acquire_timeout)
-        if not identifier:
-            raise Exception(f"Could not acquire lock: {lock_name}")
-        
-        try:
-            yield identifier
-        finally:
-            self.release_lock(lock_name, identifier)
-    
-    # 🔥 COORDINATION ACTIF-ACTIF
-    def register_server_heartbeat(self, server_id: str, ttl: timedelta = timedelta(seconds=60)) -> bool:
-        """Enregistre un heartbeat de serveur"""
-        try:
-            key = f"servers:heartbeats"
-            pipeline = self.client.pipeline()
-            pipeline.hset(key, server_id, datetime.utcnow().isoformat())
-            pipeline.expire(key, int(ttl.total_seconds() * 2))
-            pipeline.execute()
-            return True
-        except Exception as e:
-            logger.error(f"Redis heartbeat registration error for server {server_id}: {e}")
-            return False
-    
-    def get_active_servers(self, max_age: timedelta = timedelta(seconds=45)) -> List[str]:
-        """Retourne les serveurs actifs"""
-        try:
-            key = f"servers:heartbeats"
-            heartbeats = self.client.hgetall(key)
-            active_servers = []
-            current_time = datetime.utcnow()
-            
-            for server_id, heartbeat_str in heartbeats.items():
-                try:
-                    heartbeat_time = datetime.fromisoformat(heartbeat_str)
-                    if (current_time - heartbeat_time) < max_age:
-                        active_servers.append(server_id)
-                except ValueError:
-                    continue
-            
-            return sorted(active_servers)
-        except Exception as e:
-            logger.error(f"Redis get active servers error: {e}")
-            return []
-    
-    def is_server_leader(self, server_id: str) -> bool:
-        """Détermine si le serveur est le leader (premier dans la liste triée)"""
-        active_servers = self.get_active_servers()
-        return bool(active_servers) and active_servers[0] == server_id
-    
-    # 🔥 HEALTH CHECK
-    def health_check(self) -> Dict[str, Any]:
-        """Vérifie la santé de Redis"""
-        try:
-            start_time = time.time()
-            self.client.ping()
-            response_time = (time.time() - start_time) * 1000
-            
-            info = self.client.info()
-            
-            return {
-                "status": "healthy",
-                "response_time_ms": round(response_time, 2),
-                "redis_version": info.get('redis_version', 'unknown'),
-                "connected_clients": info.get('connected_clients', 0),
-                "used_memory_human": info.get('used_memory_human', 'unknown'),
-                "cluster_mode": self._cluster_mode
-            }
-        except Exception as e:
-            logger.error(f"Redis health check failed: {e}")
-            return {
-                "status": "unhealthy",
-                "error": str(e),
-                "cluster_mode": self._cluster_mode
-            }
-```
-
-### 2. **Celery App avec RedisManager** (version corrigée)
-
-```python
 # workflow/celery_app.py
 from datetime import timedelta
 import logging
@@ -309,7 +6,6 @@ from kombu import Queue, Exchange
 from celery.signals import worker_ready, worker_shutdown
 from config import Config
 from api.app import create_app
-from workflow.redis_manager import RedisManager
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +17,7 @@ def make_celery(flask_app):
         enable_utc=True,
     )
 
-    # ---- Configuration HA & scaling
+    # ---- Configuration pour Redis Cluster
     celery_app.conf.update(
         # Fiabilité
         task_acks_late=True,
@@ -329,10 +25,19 @@ def make_celery(flask_app):
         task_time_limit=300,
         task_soft_time_limit=270,
 
-        # Broker résilient
+        # Broker résilient pour cluster
         broker_connection_retry_on_startup=True,
         broker_connection_retry=True,
         broker_connection_max_retries=100,
+        broker_transport_options={
+            'visibility_timeout': 3600,  # Important pour cluster
+            'fanout_prefix': True,
+            'fanout_patterns': True,
+            'global_keyprefix': 'celery:',
+            'socket_keepalive': True,
+            'retry_on_timeout': True,
+            'max_connections': 10
+        },
 
         # Sérialisation
         task_serializer='json',
@@ -343,16 +48,36 @@ def make_celery(flask_app):
         # Events
         worker_send_task_events=True,
         task_send_sent_event=True,
+        
+        # 🔥 CONFIGURATION BEAT POUR REDIS CLUSTER
+        beat_max_loop_interval=30,  # Vérification plus fréquente
+        beat_sync_every=1,  # Synchronisation immédiate
     )
 
-    # ---- RedBeat pour Beat distribué (optionnel)
-    if getattr(Config, 'REDBEAT_ENABLED', False):
+    # ---- RedBeat Scheduler (RECOMMANDÉ pour cluster)
+    if getattr(Config, 'REDBEAT_ENABLED', True):
         celery_app.conf.update(
             beat_scheduler='redbeat.RedBeatScheduler',
             redbeat_redis_url=Config.CELERY_BROKER_URL,
-            redbeat_lock_key='redbeat:lock',
             redbeat_key_prefix='redbeat:',
+            redbeat_lock_key='redbeat:lock',
+            redbeat_lock_timeout=60,  # Verrou de 60s
         )
+        logger.info("RedBeat scheduler configured for Redis Cluster")
+    else:
+        # Scheduler par défaut (moins recommandé pour cluster)
+        celery_app.conf.beat_schedule = {
+            'process-scheduled-steps-every-5min': {
+                'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
+                'schedule': timedelta(seconds=300),
+                'options': {'queue': 'beat_tasks'}
+            },
+            'distributed-health-check': {
+                'task': 'workflow.celery_app.distributed_health_check',
+                'schedule': timedelta(seconds=60),
+                'options': {'queue': 'beat_tasks'}
+            }
+        }
 
     # ---- Files d'attente
     default_ex = Exchange('default', type='direct')
@@ -387,20 +112,6 @@ def make_celery(flask_app):
         },
     }
 
-    # ---- Beat schedule avec coordination distribué
-    celery_app.conf.beat_schedule = {
-        'process-scheduled-steps-every-5min': {
-            'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
-            'schedule': timedelta(seconds=300),
-            'options': {'queue': 'beat_tasks'}
-        },
-        'distributed-health-check': {
-            'task': 'workflow.celery_app.distributed_health_check',
-            'schedule': timedelta(seconds=60),
-            'options': {'queue': 'beat_tasks'}
-        }
-    }
-
     # ---- Contexte Flask pour toutes les tasks
     class FlaskContextTask(celery_app.Task):
         def __call__(self, *args, **kwargs):
@@ -409,8 +120,6 @@ def make_celery(flask_app):
 
         def on_failure(self, exc, task_id, args, kwargs, einfo):
             logger.error(f"Task {task_id} failed: {exc}")
-            # Log supplémentaire avec contexte
-            logger.error(f"Task args: {args}, kwargs: {kwargs}")
             return super().on_failure(exc, task_id, args, kwargs, einfo)
 
     celery_app.Task = FlaskContextTask
@@ -421,203 +130,24 @@ def make_celery(flask_app):
         logger.info(f"Worker {sender.hostname} ready")
         # Enregistrement du worker
         try:
-            redis_manager = RedisManager(Config)
-            redis_manager.register_server_heartbeat(sender.hostname)
+            with flask_app.app_context():
+                flask_app.redis_client.register_server_heartbeat(sender.hostname)
         except Exception as e:
             logger.error(f"Failed to register worker heartbeat: {e}")
 
     @worker_shutdown.connect
     def worker_shutdown_handler(sender, **kw):
         logger.info(f"Worker {sender.hostname} shutting down")
+        # Nettoyage optionnel
+        try:
+            with flask_app.app_context():
+                # Le TTL gère automatiquement l'expiration
+                pass
+        except Exception as e:
+            logger.error(f"Error during worker shutdown: {e}")
 
     return celery_app
 
 # Initialisation
 flask_app = create_app(Config)
 celery_app = make_celery(flask_app)
-
-# 🔥 Health check avec RedisManager
-@celery_app.task(bind=True)
-def health_check(self):
-    from datetime import datetime
-    redis_manager = RedisManager(Config)
-    
-    redis_health = redis_manager.health_check()
-    active_servers = redis_manager.get_active_servers()
-    is_leader = redis_manager.is_server_leader(self.request.hostname)
-    
-    return {
-        "status": "OK",
-        "worker": self.request.hostname,
-        "is_leader": is_leader,
-        "active_workers": active_servers,
-        "total_workers": len(active_servers),
-        "redis": redis_health,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-
-@celery_app.task(bind=True)
-def distributed_health_check(self):
-    """Health check distribué pour la coordination"""
-    return health_check(self)
-```
-
-### 3. **Scheduler avec verrous distribués**
-
-```python
-# workflow/tasks/core/scheduler.py
-from sqlalchemy.exc import SQLAlchemyError
-from workflow.celery_app import celery_app as app
-from api.models import FormContainer, WorkflowStep
-from api.extensions import db
-from datetime import datetime
-import logging
-from workflow.redis_manager import RedisManager
-from config import Config
-
-logger = logging.getLogger(__name__)
-
-@app.task(bind=True)
-def process_scheduled_steps(self) -> None:
-    """Tâche planifiée avec lock distribué pour active-active"""
-    
-    redis_manager = RedisManager(Config)
-    
-    # 🔥 Lock distribué pour éviter les duplications
-    try:
-        with redis_manager.lock("process_scheduled_steps", timeout=300, acquire_timeout=10):
-            logger.info(f"Acquired lock for scheduled steps processing on {self.request.hostname}")
-            
-            # Rafraîchir le heartbeat
-            redis_manager.register_server_heartbeat(self.request.hostname)
-            
-            try:
-                with db.session.begin():
-                    steps = (
-                        WorkflowStep.query
-                        .filter(
-                            WorkflowStep.status == 'pending',
-                            WorkflowStep.scheduled_time <= datetime.utcnow()
-                        )
-                        .with_for_update(skip_locked=True)
-                        .limit(100)
-                        .all()
-                    )
-
-                    for step in steps:
-                        container = FormContainer.query.get(step.container_id)
-                        if not container:
-                            step.status = 'revoked'
-                            continue
-
-                        # Marquage immédiat en processing
-                        step.status = 'processing'
-                        step.locked_at = datetime.utcnow()
-
-                        if step.step_type == 'reminder':
-                            from workflow.tasks.operations.reminder import send_reminder_task
-                            send_reminder_task.apply_async(
-                                args=[step.id, step.form_id, step.container_id, step.step_index]
-                            )
-                        else:
-                            from workflow.tasks.operations.escalate import send_escalate_task
-                            send_escalate_task.apply_async(
-                                args=[step.id, step.form_id, step.container_id]
-                            )
-
-                logger.info(f"Successfully processed {len(steps)} scheduled steps")
-                
-            except SQLAlchemyError as e:
-                logger.error(f"Database error in step processing: {e}")
-                db.session.rollback()
-                self.retry(countdown=300)
-                
-    except Exception as e:
-        logger.info(f"Could not acquire lock for scheduled steps: {e}")
-        # Ne pas retry - un autre worker traite déjà
-        return {"status": "skipped", "reason": "lock_not_acquired"}
-```
-
-### 4. **Configuration finale**
-
-```python
-# config.py
-import os
-import socket
-
-class Config:
-    # Identification serveur
-    SERVER_ID = os.getenv('SERVER_ID', socket.gethostname())
-    
-    # Redis Configuration
-    REDIS_CLUSTER_MODE = os.getenv('REDIS_CLUSTER_MODE', 'false').lower() == 'true'
-    REDIS_CLUSTER_NODES = [
-        {"host": os.getenv('REDIS_NODE1', 'redis-node1'), "port": 6379},
-        {"host": os.getenv('REDIS_NODE2', 'redis-node2'), "port": 6379},
-        {"host": os.getenv('REDIS_NODE3', 'redis-node3'), "port": 6379},
-    ]
-    REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-    REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
-    
-    # Celery
-    CELERY_BROKER_URL = REDIS_URL
-    CELERY_RESULT_BACKEND = REDIS_URL
-    
-    # RedBeat optionnel
-    REDBEAT_ENABLED = os.getenv('REDBEAT_ENABLED', 'false').lower() == 'true'
-    
-    # Optimisations
-    CELERY_WORKER_PREFETCH_MULTIPLIER = 1
-    CELERY_ACKS_LATE = True
-    CELERY_TASK_REJECT_ON_WORKER_LOST = True
-```
-
-### 5. **Initialisation dans l'app Flask**
-
-```python
-# api/app.py
-from flask import Flask
-from config import Config
-from workflow.redis_manager import RedisManager
-
-def create_app(config_class=Config):
-    app = Flask(__name__)
-    app.config.from_object(config_class)
-    
-    # Extensions existantes
-    from api.extensions import db, mail
-    db.init_app(app)
-    mail.init_app(app)
-    
-    # 🔥 Redis Manager
-    app.redis_manager = RedisManager(config_class)
-    
-    # Blueprints, etc.
-    # ...
-    
-    return app
-```
-
-## 🚀 **Déploiement Actif-Actif**
-
-```bash
-# Sur le serveur 1
-SERVER_ID=backend-1 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app worker --queues=default,high_priority,beat_tasks -l info -c 4
-SERVER_ID=backend-1 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app beat -l info
-
-# Sur le serveur 2  
-SERVER_ID=backend-2 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app worker --queues=default,high_priority,beat_tasks -l info -c 4
-SERVER_ID=backend-2 REDBEAT_ENABLED=true celery -A workflow.celery_app.celery_app beat -l info
-```
-
-## ✅ **Avantages de cette solution**
-
-1. **🎯 RedisManager unique** : Abstraction complète pour standalone et cluster
-2. **🔥 Utilise redis-py natif** : Pas de code maison, robuste et maintenable
-3. **🚀 Fonctionnalités Redis 8.2.2** : JSON, ZRANDMEMBER, etc.
-4. **🔒 Locks distribués** : Coordination actif-actif fiable
-5. **❤️ Health checks** : Monitoring complet du cluster
-6. **📈 Scalable** : Ajout facile de nouveaux serveurs
-7. **🐛 Debuggable** : Logging complet et gestion d'erreurs
-
-Cette architecture combine le meilleur des deux approches avec une gestion Redis professionnelle ! 🎉
