@@ -1,273 +1,292 @@
-Vous avez raison, je vois plusieurs problèmes dans le code que j'ai proposé. Voici les corrections :
+Excellent Hafsa 👏
+Puisque tu as déjà **buildé Redis 8.2.2** (serveur + cli) — parfait 👌
+On va simplement automatiser **le déploiement Sentinel haute disponibilité (3 nœuds)** avec **Ansible**, sans utiliser les packages système.
 
-## 1. Supprimer la redirection vers '/login'
+---
 
-Corrigeons le `CallbackComponent` :
+## 🎯 Objectif
 
-```typescript
-import { Component, OnInit } from '@angular/core';
-import { ActivatedRoute, Router } from '@angular/router';
-import { OAuthService } from 'angular-oauth2-oidc';
+Déployer une architecture **Redis Sentinel 8.2.2 HA** sur **3 serveurs** :
 
-@Component({
-  template: `
-    <div class="callback-container">
-      <p>Traitement de l'authentification...</p>
-      <div *ngIf="error" class="error">
-        Erreur: {{ error }}
-        <button (click)="retry()">Réessayer</button>
-      </div>
-    </div>
-  `
-})
-export class CallbackComponent implements OnInit {
-  error: string = '';
+| Serveur  | Rôle Redis | Rôle Sentinel |
+| -------- | ---------- | ------------- |
+| **srv1** | Master     | Sentinel      |
+| **srv2** | Replica    | Sentinel      |
+| **srv3** | Replica    | Sentinel      |
 
-  constructor(
-    private oauthService: OAuthService,
-    private authService: AuthService,
-    private router: Router,
-    private route: ActivatedRoute
-  ) {}
+Les sentinels vont surveiller un master nommé `mymaster` avec mot de passe `S3cur3P@ss`.
 
-  async ngOnInit() {
-    await this.handleAuthentication();
-  }
+---
 
-  async handleAuthentication() {
-    try {
-      // Traiter la réponse OAuth
-      await this.oauthService.tryLogin();
+## 🗂️ Structure du playbook
 
-      if (this.oauthService.hasValidAccessToken()) {
-        // Charger le profil utilisateur
-        await this.authService.loadUserProfile();
-
-        // Récupérer l'URL originale ou utiliser une URL par défaut
-        const returnUrl = this.getReturnUrl();
-        this.router.navigateByUrl(returnUrl);
-      } else {
-        this.error = 'Échec de l\'authentification - Aucun token valide';
-        console.error('Token invalide après authentification');
-      }
-    } catch (error) {
-      console.error('Erreur dans le callback:', error);
-      this.error = error.message || 'Erreur lors de l\'authentification';
-    }
-  }
-
-  private getReturnUrl(): string {
-    // Essayer de récupérer l'URL depuis le state OAuth
-    const state = this.oauthService.state;
-    if (state && state !== '') {
-      return state;
-    }
-
-    // Essayer depuis les query params
-    const returnUrl = this.route.snapshot.queryParams['state'] ||
-                     this.route.snapshot.queryParams['returnUrl'];
-
-    // URL par défaut si rien n'est trouvé
-    return returnUrl || '/';
-  }
-
-  retry() {
-    this.error = '';
-    this.handleAuthentication();
-  }
-}
+```
+ansible/
+├── inventory.ini
+├── deploy_redis_sentinel.yml
+└── roles/
+    └── redis_sentinel/
+        ├── tasks/
+        │   └── main.yml
+        ├── templates/
+        │   ├── redis.conf.j2
+        │   └── sentinel.conf.j2
+        └── files/
+            ├── redis-server
+            └── redis-cli
 ```
 
-## 2. Explication du CallbackComponent
+---
 
-Le `CallbackComponent` est crucial car :
-- C'est la page vers laquelle Apigee redirige après l'authentification
-- Il récupère le code d'autorisation depuis l'URL
-- Il échange ce code contre un token d'accès
-- Il redirige vers l'URL originale
+## 📋 1. **inventory.ini**
 
-## 3. Correction du AuthGuard pour gérer les URLs
-
-```typescript
-import { Injectable } from '@angular/core';
-import { CanActivate, ActivatedRouteSnapshot, RouterStateSnapshot, Router } from '@angular/router';
-import { AuthService } from './auth.service';
-
-@Injectable({ providedIn: 'root' })
-export class AuthGuard implements CanActivate {
-  constructor(private authService: AuthService, private router: Router) {}
-
-  canActivate(route: ActivatedRouteSnapshot, state: RouterStateSnapshot): Promise<boolean> {
-    return new Promise((resolve) => {
-      if (this.authService.isLoggedIn) {
-        resolve(true);
-      } else {
-        // Stocker l'URL courante et lancer l'authentification
-        const returnUrl = state.url; // ex: /form-view/c73a475d-1742-43d6-901a-c21ad8ca4b7c
-
-        // Lancer le flux OAuth avec l'URL de retour
-        this.authService.initLoginFlow(returnUrl);
-        resolve(false);
-      }
-    });
-  }
-}
+```ini
+[redis_sentinel]
+srv1 ansible_host=10.0.0.1 redis_role=master
+srv2 ansible_host=10.0.0.2 redis_role=replica
+srv3 ansible_host=10.0.0.3 redis_role=replica
 ```
 
-## 4. Service AuthService corrigé
+---
 
-```typescript
-@Injectable({ providedIn: 'root' })
-export class AuthService {
-  private userProfileSubject = new BehaviorSubject<any>(null);
-  public userProfile$ = this.userProfileSubject.asObservable();
+## 📋 2. **deploy_redis_sentinel.yml**
 
-  constructor(
-    private oauthService: OAuthService,
-    private router: Router
-  ) {
-    this.configure();
-  }
+```yaml
+---
+- name: Deploy Redis 8.2.2 Sentinel Cluster
+  hosts: redis_sentinel
+  become: yes
+  vars:
+    redis_version: "8.2.2"
+    redis_install_dir: "/opt/redis-{{ redis_version }}"
+    redis_data_dir: "/var/lib/redis"
+    redis_log_dir: "/var/log/redis"
+    redis_conf_dir: "/etc/redis"
+    redis_user: "redis"
+    redis_port: 6379
+    sentinel_port: 26379
+    redis_password: "S3cur3P@ss"
+    redis_master_name: "mymaster"
+    redis_master_host: "10.0.0.1"
 
-  private configure() {
-    this.oauthService.configure(authConfig);
-
-    this.oauthService.events.subscribe((event: OAuthEvent) => {
-      if (event.type === 'token_received') {
-        console.log('Token reçu');
-        this.loadUserProfile();
-      }
-    });
-
-    // Vérifier au démarrage si on a déjà un token valide
-    this.tryLogin();
-  }
-
-  public tryLogin(): Promise<void> {
-    return this.oauthService.tryLogin().then(() => {
-      if (this.oauthService.hasValidAccessToken()) {
-        console.log('Token valide trouvé au démarrage');
-        this.loadUserProfile();
-        return Promise.resolve();
-      }
-    });
-  }
-
-  public initLoginFlow(returnUrl?: string): void {
-    // Si une URL de retour est spécifiée, elle sera passée dans le state
-    this.oauthService.initLoginFlow(returnUrl);
-  }
-
-  public loadUserProfile(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.oauthService.hasValidAccessToken()) {
-        if (authConfig.userinfoEndpoint) {
-          this.oauthService.loadUserProfile().then(profile => {
-            this.userProfileSubject.next(profile);
-            resolve();
-          }).catch(error => {
-            console.warn('Impossible de charger le profil:', error);
-            this.createBasicProfileFromToken();
-            resolve();
-          });
-        } else {
-          this.createBasicProfileFromToken();
-          resolve();
-        }
-      } else {
-        reject(new Error('No valid access token'));
-      }
-    });
-  }
-
-  private createBasicProfileFromToken(): void {
-    const claims = this.oauthService.getIdentityClaims();
-    if (claims) {
-      this.userProfileSubject.next(claims);
-    } else {
-      const token = this.oauthService.getAccessToken();
-      if (token) {
-        try {
-          const payload = JSON.parse(atob(token.split('.')[1]));
-          this.userProfileSubject.next({
-            sub: payload.sub,
-            name: payload.name,
-            email: payload.email,
-            // autres claims
-          });
-        } catch (e) {
-          console.warn('Impossible de parser le token:', e);
-        }
-      }
-    }
-  }
-
-  public logout(): void {
-    this.oauthService.logOut();
-    this.userProfileSubject.next(null);
-    // Rediriger vers la page d'accueil ou une autre page après logout
-    this.router.navigate(['/']);
-  }
-
-  public get isLoggedIn(): boolean {
-    return this.oauthService.hasValidAccessToken();
-  }
-
-  public get accessToken(): string {
-    return this.oauthService.getAccessToken();
-  }
-}
+  roles:
+    - redis_sentinel
 ```
 
-## 5. Configuration des routes
+---
 
-```typescript
-const routes: Routes = [
-  {
-    path: 'callback',
-    component: CallbackComponent
-  },
-  {
-    path: 'form-view/:id',
-    component: FormViewComponent,  // Votre composant
-    canActivate: [AuthGuard]       // Protégé par AuthGuard
-  },
-  // ... autres routes
-  {
-    path: '**',
-    redirectTo: '/'
-  }
-];
+## 📋 3. **roles/redis_sentinel/tasks/main.yml**
+
+```yaml
+---
+- name: Ensure Redis user exists
+  ansible.builtin.user:
+    name: "{{ redis_user }}"
+    shell: /sbin/nologin
+    system: yes
+
+- name: Create directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ redis_user }}"
+    group: "{{ redis_user }}"
+    mode: "0755"
+  loop:
+    - "{{ redis_data_dir }}"
+    - "{{ redis_log_dir }}"
+    - "{{ redis_conf_dir }}"
+
+- name: Copy redis-server and redis-cli binaries
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - redis-server
+    - redis-cli
+
+- name: Generate redis.conf
+  ansible.builtin.template:
+    src: "redis.conf.j2"
+    dest: "{{ redis_conf_dir }}/redis.conf"
+    owner: "{{ redis_user }}"
+    group: "{{ redis_user }}"
+    mode: "0644"
+  notify: Restart Redis
+
+- name: Generate sentinel.conf
+  ansible.builtin.template:
+    src: "sentinel.conf.j2"
+    dest: "{{ redis_conf_dir }}/sentinel.conf"
+    owner: "{{ redis_user }}"
+    group: "{{ redis_user }}"
+    mode: "0644"
+  notify: Restart Sentinel
+
+- name: Create systemd service for redis
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/redis.service
+    content: |
+      [Unit]
+      Description=Redis Server
+      After=network.target
+
+      [Service]
+      User={{ redis_user }}
+      ExecStart=/usr/local/bin/redis-server {{ redis_conf_dir }}/redis.conf
+      ExecStop=/usr/local/bin/redis-cli -a {{ redis_password }} shutdown
+      Restart=always
+      LimitNOFILE=10000
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart Redis
+
+- name: Create systemd service for sentinel
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/redis-sentinel.service
+    content: |
+      [Unit]
+      Description=Redis Sentinel
+      After=network.target redis.service
+
+      [Service]
+      User={{ redis_user }}
+      ExecStart=/usr/local/bin/redis-sentinel {{ redis_conf_dir }}/sentinel.conf --daemonize no
+      Restart=always
+      LimitNOFILE=10000
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: Restart Sentinel
+
+- name: Enable and start services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+  loop:
+    - redis
+    - redis-sentinel
+
+# Handlers
+- name: Restart Redis
+  ansible.builtin.systemd:
+    name: redis
+    state: restarted
+    daemon_reload: yes
+
+- name: Restart Sentinel
+  ansible.builtin.systemd:
+    name: redis-sentinel
+    state: restarted
+    daemon_reload: yes
 ```
 
-## 6. AppComponent simplifié
+---
 
-```typescript
-@Component({
-  selector: 'app-root',
-  template: `<router-outlet></router-outlet>`
-})
-export class AppComponent {
-  // Pas besoin d'appeler tryLogin() ici car le CallbackComponent s'en charge
-  // et le AuthGuard gère la protection des routes
-}
+## 📋 4. **roles/redis_sentinel/templates/redis.conf.j2**
+
+```jinja
+bind 0.0.0.0
+port {{ redis_port }}
+protected-mode no
+
+dir {{ redis_data_dir }}
+logfile {{ redis_log_dir }}/redis.log
+dbfilename dump.rdb
+appendonly yes
+
+requirepass {{ redis_password }}
+masterauth {{ redis_password }}
+
+{% if redis_role == "replica" %}
+replicaof {{ redis_master_host }} {{ redis_port }}
+{% endif %}
+
+timeout 0
+tcp-keepalive 60
 ```
 
-## 7. Diagnostic du problème d'authentification
+---
 
-Si vous avez l'erreur "échec d'authentification" mais que vous êtes authentifié, vérifiez :
+## 📋 5. **roles/redis_sentinel/templates/sentinel.conf.j2**
 
-### Dans la console du navigateur :
-```typescript
-// Ajoutez ce debug dans auth.service.ts
-console.log('Token valide?', this.oauthService.hasValidAccessToken());
-console.log('Access Token:', this.oauthService.getAccessToken());
-console.log('Identity Claims:', this.oauthService.getIdentityClaims());
+```jinja
+port {{ sentinel_port }}
+bind 0.0.0.0
+protected-mode no
+daemonize no
+dir /tmp
+logfile {{ redis_log_dir }}/sentinel.log
+
+sentinel monitor {{ redis_master_name }} {{ redis_master_host }} {{ redis_port }} 2
+sentinel auth-pass {{ redis_master_name }} {{ redis_password }}
+sentinel down-after-milliseconds {{ redis_master_name }} 5000
+sentinel failover-timeout {{ redis_master_name }} 10000
+sentinel parallel-syncs {{ redis_master_name }} 1
 ```
 
-### Vérifiez la configuration Apigee :
-- L'URL de callback dans Apigee correspond à `http://localhost:4200/callback`
-- Le client ID est correct
-- Les scopes sont bien configurés
+---
 
-Cette version corrigée devrait résoudre vos problèmes de redirection et gérer correctement vos URLs comme `/form-view/c73a475d-1742-43d6-901a-c21ad8ca4b7c`.
+## 🚀 6. **Déploiement**
+
+> ⚙️ Assure-toi d’avoir ton `redis-server` et `redis-cli` déjà compilés dans `roles/redis_sentinel/files/`.
+
+Puis lance :
+
+```bash
+ansible-playbook -i inventory.ini deploy_redis_sentinel.yml
+```
+
+---
+
+## ✅ 7. **Vérifications post-déploiement**
+
+Sur n’importe quel nœud :
+
+```bash
+redis-cli -a S3cur3P@ss info replication
+```
+
+Tu dois voir :
+
+```
+role:master
+connected_slaves:2
+```
+
+Et côté Sentinel :
+
+```bash
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+```
+
+Tu verras :
+
+```
+1) "10.0.0.1"
+2) "6379"
+```
+
+---
+
+## 🧠 Bonus : Test de failover
+
+Simule un crash du master :
+
+```bash
+sudo systemctl stop redis
+sleep 10
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+```
+
+Le nouveau master sera automatiquement **srv2** ou **srv3** 🔁
+
+---
+
+Souhaites-tu que je te génère la **version avec failover monitoring via Prometheus exporter** (pour voir les bascules en live) ?
+👉 C’est souvent très utile en prod (et je peux te l’intégrer au même playbook).
