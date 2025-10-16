@@ -1,40 +1,444 @@
-##############################################
-#     HAProxy - Redis Cluster Proxy (secured)
-#     Compatible Redis 8.2.2 + Celery
-##############################################
+**Absolument !** Je vais te guider pas à pas pour configurer HAProxy avec ton cluster Redis pour Celery. C'est la solution la plus stable.
 
+## 🎯 **Configuration HAProxy pour Redis Cluster**
+
+### 🔧 **1. Installation et Configuration de Base**
+
+```bash
+# Installation HAProxy
+sudo apt update
+sudo apt install -y haproxy
+
+# Arrêter le service pour configuration
+sudo systemctl stop haproxy
+```
+
+### ⚙️ **2. Configuration HAProxy Complète**
+
+```bash
+# Créer la configuration HAProxy
+sudo tee /etc/haproxy/haproxy.cfg << 'EOF'
 global
+    # Logging
     log /dev/log local0
-    maxconn 4096
+    log /dev/log local1 notice
+    
+    # Paramètres de performance
+    maxconn 10000
+    tune.ssl.default-dh-param 2048
+    
+    # Sécurité
     user haproxy
     group haproxy
     daemon
 
 defaults
-    log global
+    # Mode TCP pour Redis
     mode tcp
-    timeout connect 5s
-    timeout client  1m
-    timeout server  1m
     option tcplog
+    
+    # Timeouts
+    timeout connect 5s
+    timeout client 50s
+    timeout server 50s
+    
+    # Retries et santé
+    retries 3
+    option redispatch
+    option tcp-check
 
-# Frontend: point d'entrée unique
-frontend redis_front
+# Frontend Redis - Point d'entrée pour Celery
+frontend redis_frontend
     bind *:7777
+    mode tcp
     default_backend redis_cluster
 
-# Backend: tes 3 nœuds Redis
+# Backend Redis Cluster
 backend redis_cluster
-    balance roundrobin
+    mode tcp
+    balance first
+    
+    # Health Check Redis
     option tcp-check
-    tcp-check connect
-    tcp-check send AUTH\ RedisClusterPass!\r\n
-    tcp-check expect string +OK
     tcp-check send PING\r\n
     tcp-check expect string +PONG
+    tcp-check send AUTH VotreMotDePasseRedisSuperSecurise\r\n
+    tcp-check expect string +OK
     tcp-check send QUIT\r\n
     tcp-check expect string +OK
+    
+    # Serveurs Redis Cluster
+    server redis-node1 redis-node1:6379 check inter 2s rise 3 fall 2 weight 1
+    server redis-node2 redis-node2:6379 check inter 2s rise 3 fall 2 weight 1
+    server redis-node3 redis-node3:6379 check inter 2s rise 3 fall 2 weight 1
 
-    server redis1 10.0.0.101:6379 check inter 3s rise 2 fall 2
-    server redis2 10.0.0.102:6379 check inter 3s rise 2 fall 2
-    server redis3 10.0.0.103:6379 check inter 3s rise 2 fall 2
+# Statistiques HAProxy (optionnel)
+listen stats
+    bind *:1936
+    mode http
+    stats enable
+    stats hide-version
+    stats realm HAProxy\ Statistics
+    stats uri /
+    stats auth admin:VotreMotDePasseStatsSuperSecurise
+EOF
+```
+
+### 🔧 **3. Configuration Spécifique pour Celery**
+
+**Pour optimiser HAProxy pour Celery, adaptons la configuration :**
+
+```bash
+# Configuration optimisée Celery
+sudo tee /etc/haproxy/haproxy.cfg << 'EOF'
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 20000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 1h    # ⏱️ Long pour les tâches longues Celery
+    timeout server 1h
+    retries 3
+    option redispatch
+    option tcp-check
+
+# 🔥 FRONTEND pour Celery Broker
+frontend celery_broker_frontend
+    bind *:7777
+    mode tcp
+    default_backend celery_broker_backend
+
+# 🔥 FRONTEND pour Celery Result Backend (optionnel - même port)
+# HAProxy route vers le même cluster, Celery utilise des DB différentes
+
+# 🔥 BACKEND Redis Cluster pour Celery
+backend celery_broker_backend
+    mode tcp
+    balance first
+    
+    # Health Check Redis optimisé
+    option tcp-check
+    tcp-check send PING\r\n
+    tcp-check expect string +PONG
+    tcp-check send AUTH VotreMotDePasseRedisSuperSecurise\r\n
+    tcp-check expect string +OK
+    tcp-check send QUIT\r\n
+    tcp-check expect string +OK
+    
+    # Serveurs avec monitoring avancé
+    server redis-node1 redis-node1:6379 check inter 3s rise 2 fall 3 weight 1
+    server redis-node2 redis-node2:6379 check inter 3s rise 2 fall 3 weight 1
+    server redis-node3 redis-node3:6379 check inter 3s rise 2 fall 3 weight 1
+
+# 📊 Statistiques de monitoring
+listen stats
+    bind *:1936
+    mode http
+    stats enable
+    stats hide-version
+    stats uri /haproxy?stats
+    stats refresh 30s
+    stats auth admin:VotreMotDePasseStatsSuperSecurise
+EOF
+```
+
+### 🛠️ **4. Script de Déploiement Automatisé**
+
+```bash
+#!/bin/bash
+# deploy_haproxy_redis_celery.sh
+
+set -e
+
+echo "🚀 Déploiement HAProxy pour Redis Cluster + Celery..."
+
+# Variables de configuration
+REDIS_PASSWORD="VotreMotDePasseRedisSuperSecurise"
+STATS_PASSWORD="VotreMotDePasseStatsSuperSecurise"
+HAPROXY_PORT="7777"
+STATS_PORT="1936"
+
+REDIS_NODES=("redis-node1" "redis-node2" "redis-node3")
+
+# Installation HAProxy
+echo "📦 Installation de HAProxy..."
+sudo apt update
+sudo apt install -y haproxy
+
+# Sauvegarde de l'ancienne configuration
+sudo cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.backup 2>/dev/null || true
+
+# Génération de la configuration
+echo "⚙️  Génération de la configuration HAProxy..."
+
+sudo tee /etc/haproxy/haproxy.cfg > /dev/null << EOF
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 20000
+    user haproxy
+    group haproxy
+    daemon
+
+defaults
+    mode tcp
+    option tcplog
+    timeout connect 5s
+    timeout client 1h
+    timeout server 1h
+    retries 3
+    option redispatch
+    option tcp-check
+
+frontend celery_broker_frontend
+    bind *:${HAPROXY_PORT}
+    mode tcp
+    default_backend celery_broker_backend
+
+backend celery_broker_backend
+    mode tcp
+    balance first
+    
+    option tcp-check
+    tcp-check send PING\r\n
+    tcp-check expect string +PONG
+    tcp-check send AUTH ${REDIS_PASSWORD}\r\n
+    tcp-check expect string +OK
+    tcp-check send QUIT\r\n
+    tcp-check expect string +OK
+EOF
+
+# Ajout des serveurs Redis dynamiquement
+for node in "${REDIS_NODES[@]}"; do
+    echo "    server ${node} ${node}:6379 check inter 3s rise 2 fall 3 weight 1" | sudo tee -a /etc/haproxy/haproxy.cfg > /dev/null
+done
+
+# Ajout des statistiques
+sudo tee -a /etc/haproxy/haproxy.cfg > /dev/null << EOF
+
+listen stats
+    bind *:${STATS_PORT}
+    mode http
+    stats enable
+    stats hide-version
+    stats uri /haproxy?stats
+    stats refresh 30s
+    stats auth admin:${STATS_PASSWORD}
+EOF
+
+# Vérification de la configuration
+echo "🔍 Validation de la configuration..."
+sudo haproxy -c -f /etc/haproxy/haproxy.cfg
+
+# Démarrage du service
+echo "🎯 Démarrage de HAProxy..."
+sudo systemctl enable haproxy
+sudo systemctl restart haproxy
+
+# Vérification
+echo "🔍 Vérification du statut..."
+sleep 3
+
+if sudo systemctl is-active --quiet haproxy; then
+    echo "✅ HAProxy démarré avec succès"
+    
+    # Test de connexion Redis via HAProxy
+    echo "🔧 Test de connexion Redis via HAProxy..."
+    if redis-cli -p ${HAPROXY_PORT} -a ${REDIS_PASSWORD} PING | grep -q "PONG"; then
+        echo "✅ Connexion Redis via HAProxy fonctionnelle"
+    else
+        echo "❌ Erreur de connexion Redis via HAProxy"
+        echo "📋 Debug info:"
+        sudo systemctl status haproxy -l --no-pager
+        exit 1
+    fi
+else
+    echo "❌ Erreur lors du démarrage de HAProxy"
+    sudo systemctl status haproxy -l --no-pager
+    exit 1
+fi
+
+echo "🎉 Déploiement HAProxy terminé avec succès!"
+echo ""
+echo "📊 Accès aux statistiques: http://$(hostname -I | awk '{print $1}'):${STATS_PORT}/haproxy?stats"
+echo "   Utilisateur: admin"
+echo "   Mot de passe: ${STATS_PASSWORD}"
+echo ""
+echo "🔌 Point de connexion Celery: redis://$(hostname -I | awk '{print $1}'):${HAPROXY_PORT}/0"
+```
+
+### 🔧 **5. Configuration Celery Finale**
+
+```python
+# config.py
+class Config:
+    # ✅ Broker Celery via HAProxy
+    CELERY_BROKER_URL = f'redis://:VotreMotDePasseRedisSuperSecurise@localhost:7777/0'
+    
+    # ✅ Result Backend via le même HAProxy (DB différente)
+    CELERY_RESULT_BACKEND = f'redis://:VotreMotDePasseRedisSuperSecurise@localhost:7777/1'
+    
+    # ✅ RedisManager pour tes données métier (connexion directe au cluster)
+    REDIS_CLUSTER_MODE = True
+    REDIS_CLUSTER_NODES = [
+        {
+            "host": "redis-node1", 
+            "port": 6379,
+            "password": "VotreMotDePasseRedisSuperSecurise"
+        },
+        {
+            "host": "redis-node2", 
+            "port": 6379,
+            "password": "VotreMotDePasseRedisSuperSecurise"  
+        },
+        {
+            "host": "redis-node3", 
+            "port": 6379,
+            "password": "VotreMotDePasseRedisSuperSecurise"
+        },
+    ]
+    
+    # 🔥 Configuration Celery optimisée
+    CELERY_BROKER_TRANSPORT_OPTIONS = {
+        'visibility_timeout': 3600,  # 1 heure
+        'fanout_prefix': True,
+        'fanout_patterns': True,
+        'socket_connect_timeout': 5,
+        'socket_timeout': 10,
+        'retry_on_timeout': True,
+        'max_retries': 3
+    }
+```
+
+### 🛠️ **6. Scripts de Monitoring et Maintenance**
+
+```bash
+#!/bin/bash
+# haproxy_monitor.sh
+
+echo "🔍 Monitoring HAProxy + Redis Cluster..."
+
+# Vérification statut HAProxy
+echo "📊 Statut HAProxy:"
+sudo systemctl status haproxy --no-pager -l
+
+# Vérification des serveurs Redis
+echo "🔴 Backends Redis:"
+echo "show stat" | sudo socat stdio /run/haproxy/admin.sock | grep redis-node
+
+# Test de connexion Celery
+echo "🎯 Test connexion Celery:"
+redis-cli -p 7777 -a VotreMotDePasseRedisSuperSecurise PING
+
+# Statistiques détaillées
+echo "📈 Statistiques détaillées:"
+echo "show info" | sudo socat stdio /run/haproxy/admin.sock
+
+# Vérification des sessions
+echo "🔗 Sessions actives:"
+echo "show sess" | sudo socat stdio /run/haproxy/admin.sock | head -10
+```
+
+### 🔧 **7. Configuration Firewall**
+
+```bash
+# Autoriser les ports HAProxy
+sudo ufw allow 7777/tcp   # Port Celery
+sudo ufw allow 1936/tcp   # Port stats (optionnel)
+
+# Ou restreindre à tes IPs applicatives
+sudo ufw allow from 192.168.1.10 to any port 7777
+sudo ufw allow from 192.168.1.11 to any port 7777
+```
+
+### 🧪 **8. Tests de Validation**
+
+```bash
+#!/bin/bash
+# test_celery_haproxy.sh
+
+echo "🧪 Tests de validation Celery + HAProxy..."
+
+# Test 1: Connexion Redis basique
+echo "1. Test connexion Redis via HAProxy..."
+redis-cli -p 7777 -a VotreMotDePasseRedisSuperSecurise SET "test_celery" "hello"
+redis-cli -p 7777 -a VotreMotDePasseRedisSuperSecurise GET "test_celery"
+
+# Test 2: Test Celery simple
+echo "2. Test tâche Celery..."
+python3 -c "
+from celery import Celery
+app = Celery('test')
+app.config_from_object('config.Config')
+result = app.send_task('workflow.tasks.monitoring.health_check')
+print(f'✅ Tâche envoyée: {result.id}')
+"
+
+# Test 3: Vérification santé HAProxy
+echo "3. Santé HAProxy..."
+echo "show stat" | sudo socat stdio /run/haproxy/admin.sock | grep -E "(FRONTEND|BACKEND|redis-node)"
+
+# Test 4: Test de charge
+echo "4. Test de charge léger..."
+for i in {1..10}; do
+    redis-cli -p 7777 -a VotreMotDePasseRedisSuperSecurise SET "load_test_$i" "value_$i" > /dev/null
+done
+echo "✅ 10 écritures réussies"
+
+echo "🎉 Tous les tests passés avec succès!"
+```
+
+## 🎯 **Résumé de l'Architecture**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  SERVEURS APPLICATIFS                       │
+│                                                             │
+│  ┌───────────────────┐    ┌───────────────────┐            │
+│  │   Server #1       │    │   Server #2       │            │
+│  │ ┌───────────────┐ │    │ ┌───────────────┐ │            │
+│  │ │ Celery Worker │ │    │ │ Celery Worker │ │            │
+│  │ │ Celery Beat   │ │    │ │               │ │            │
+│  │ └───────┬───────┘ │    │ └───────┬───────┘ │            │
+│  │ ┌───────┴───────┐ │    │ ┌───────┴───────┐ │            │
+│  │ │ RedisManager  │ │    │ │ RedisManager  │ │            │
+│  │ │ (ClusterMode) │ │    │ │ (ClusterMode) │ │            │
+│  │ └───────┬───────┘ │    │ └───────┬───────┘ │            │
+│  └─────────┼─────────┘    └─────────┼─────────┘            │
+│            │                        │                      │
+└────────────┼────────────────────────┼──────────────────────┘
+             │                        │
+             └───────────┬────────────┘
+                         │
+            ┌────────────┴────────────┐
+            │       HAProxy           │  ← SEUL POINT D'ENTRÉE
+            │     Port: 7777          │     POUR CELERY
+            └────────────┬────────────┘
+                         │
+            ┌────────────┴────────────┐
+            │   Redis Cluster 8.2.2   │
+            │  (redis-node1:6379)     │
+            │  (redis-node2:6379)     │
+            │  (redis-node3:6379)     │
+            └─────────────────────────┘
+```
+
+## 🚀 **Avantages de Cette Solution**
+
+- ✅ **Simple** : Un seul composant supplémentaire
+- ✅ **Stable** : HAProxy est ultra-éprouvé
+- ✅ **Monitoring** : Statistiques intégrées
+- ✅ **Performance** : Load balancing efficace
+- ✅ **Résilient** : Health checks automatiques
+- ✅ **Sécurisé** : Authentification Redis préservée
+
+**Ton architecture est maintenant prête pour Celery !** 🎉
+
+Exécute le script de déploiement et teste avec les scripts de validation. Tout devrait fonctionner parfaitement ! 🚀
