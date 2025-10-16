@@ -1,0 +1,230 @@
+Parfait Hafsa 👏
+Je vois que ton playbook est déjà **très bien structuré** — tu as :
+
+* une séparation claire entre `redis.conf.j2` / `sentinel.conf.j2`,
+* des handlers pour redémarrer les services,
+* et une structure adaptée à un déploiement automatisé (Ansible pro, bravo 💪).
+
+Je vais t’indiquer **exactement les modifications à faire** pour transformer ton playbook actuel en **architecture Redis + Sentinel HA**, compatible avec **Celery** — sans casser ta logique existante.
+
+---
+
+## 🧩 Objectif final
+
+Sur **chaque serveur Redis** :
+
+* 1 fichier `redis.conf`
+* 1 fichier `sentinel.conf`
+* 2 services distincts :
+
+  * `redis_master.service` ou `redis_replica.service`
+  * `redis_sentinel.service`
+
+---
+
+## ⚙️ Étape 1 — Structure `hosts.yml`
+
+Tu es déjà presque bonne :
+
+```yaml
+redis:
+  hosts:
+    eurvlii333435.xmp.net.intra:
+      master: yes
+      replica: no
+    eurvlii333455.xmp.net.intra:
+      master: no
+      replica: yes
+    eurvlii333906.xmp.net.intra:
+      master: no
+      replica: yes
+```
+
+✅ garde exactement cette structure.
+C’est ce que tes templates utiliseront pour savoir qui configure quoi.
+
+---
+
+## ⚙️ Étape 2 — Adapter `redis.conf.j2`
+
+Tu dois différencier master / replica :
+
+```jinja
+# redis.conf.j2
+port 6379
+bind 0.0.0.0
+daemonize yes
+protected-mode no
+dir {{ app_dir }}/data
+logfile {{ app_dir }}/logs/redis.log
+
+requirepass {{ vault.redis.password }}
+masterauth {{ vault.redis.password }}
+
+{% if node.status == 'master' %}
+# Master
+{% else %}
+# Replica
+replicaof {{ hostvars[groups['redis'][0]]['ansible_host'] | default(groups['redis'][0]) }} 6379
+{% endif %}
+```
+
+➡️ Le bloc `replicaof` pointe toujours vers ton **premier host (le master)**.
+
+---
+
+## ⚙️ Étape 3 — Créer `sentinel.conf.j2`
+
+Ton template doit être le même pour tous les nœuds :
+
+```jinja
+port 26379
+bind 0.0.0.0
+daemonize yes
+dir {{ app_dir }}/data
+logfile {{ app_dir }}/logs/sentinel.log
+
+sentinel monitor mymaster {{ hostvars[groups['redis'][0]]['ansible_host'] | default(groups['redis'][0]) }} 6379 2
+sentinel auth-pass mymaster {{ vault.redis.password }}
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 10000
+sentinel parallel-syncs mymaster 1
+```
+
+---
+
+## ⚙️ Étape 4 — Créer un service `redis-sentinel.service.j2`
+
+Ajoute un nouveau template :
+`roles/redis/templates/redis-sentinel.service.j2`
+
+```ini
+[Unit]
+Description=Redis Sentinel Service
+After=network.target
+
+[Service]
+ExecStart={{ app_dir }}/bin/redis-sentinel {{ app_dir }}/conf/sentinel.conf
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=always
+User={{ service_account }}
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## ⚙️ Étape 5 — Modifier ton `configure.yml`
+
+Tu as déjà :
+
+```yaml
+- src: redis.conf.j2
+- src: sentinel.conf.j2
+```
+
+Ajoute maintenant aussi :
+
+```yaml
+- src: redis-sentinel.service.j2
+  dest: "/usr/lib/systemd/system/redis-sentinel.service"
+  mode: "0644"
+```
+
+et ajoute dans la même tâche :
+
+```yaml
+- name: enable redis-sentinel service
+  shell: |
+    systemctl daemon-reload
+    systemctl enable redis-sentinel
+    systemctl restart redis-sentinel
+  become: yes
+```
+
+---
+
+## ⚙️ Étape 6 — Modifier tes handlers
+
+Tu as actuellement :
+
+```yaml
+- name: restart redis master
+  shell: sudo systemctl restart redis_master
+```
+
+Ajoute un handler pour le sentinel :
+
+```yaml
+- name: restart redis sentinel
+  shell: sudo systemctl restart redis-sentinel
+  become: yes
+```
+
+et notifie-le depuis `configure.yml` :
+
+```yaml
+notify:
+  - restart redis {{ node.status }}
+  - restart redis sentinel
+```
+
+---
+
+## ⚙️ Étape 7 — Vérification Ansible
+
+Quand tu feras ton run :
+
+```bash
+ansible-playbook -i stg/hosts.yml redis.yml
+```
+
+Tu dois voir :
+
+* Création de `/etc/systemd/system/redis-sentinel.service`
+* Installation de `redis.conf` et `sentinel.conf` sur les 3 serveurs
+* Redémarrage de :
+
+  * `redis_master` sur 1 serveur
+  * `redis_replica` sur 2 serveurs
+  * `redis-sentinel` sur les 3
+
+---
+
+## ✅ Vérification manuelle
+
+Sur chaque serveur :
+
+```bash
+systemctl status redis*
+```
+
+Doit montrer :
+
+```
+redis_master.service     active (running)
+redis-sentinel.service   active (running)
+```
+
+et côté Redis CLI :
+
+```bash
+redis-cli -p 26379 info Sentinel | grep master
+```
+
+doit afficher ton `mymaster` avec un seul master et deux replicas.
+
+---
+
+## 💡 Résumé visuel
+
+| Serveur          | Fichiers                  | Services actifs               |
+| ---------------- | ------------------------- | ----------------------------- |
+| redis1 (master)  | redis.conf, sentinel.conf | redis_master, redis-sentinel  |
+| redis2 (replica) | redis.conf, sentinel.conf | redis_replica, redis-sentinel |
+| redis3 (replica) | redis.conf, sentinel.conf | redis_replica, redis-sentinel |
+
+---
+
+Souhaites-tu que je te génère **les fichiers complets finaux (`redis.conf.j2`, `sentinel.conf.j2`, `redis-sentinel.service.j2`)** prêts à coller dans ton `roles/redis/templates/` ?
