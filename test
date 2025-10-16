@@ -1,153 +1,395 @@
-# workflow/celery_app.py
-from datetime import timedelta
-import logging
-from celery import Celery
-from kombu import Queue, Exchange
-from celery.signals import worker_ready, worker_shutdown
-from config import Config
-from api.app import create_app
+**Voici la configuration complète de KeyDB Proxy pour ton cluster Redis protégé par mot de passe :**
 
-logger = logging.getLogger(__name__)
+## 🔐 Configuration KeyDB Proxy Sécurisée
 
-def make_celery(flask_app):
-    celery_app = Celery(
-        __name__,
-        broker=Config.CELERY_BROKER_URL,
-        backend=Config.CELERY_RESULT_BACKEND,
-        enable_utc=True,
-    )
+### 1. **Installation de KeyDB Proxy**
 
-    # ---- Configuration pour Redis Cluster
-    celery_app.conf.update(
-        # Fiabilité
-        task_acks_late=True,
-        worker_prefetch_multiplier=1,
-        task_time_limit=300,
-        task_soft_time_limit=270,
+```bash
+# Téléchargement et installation
+wget https://download.keydb.dev/pkg/keydb-proxy_6.3.3_amd64.deb
+sudo dpkg -i keydb-proxy_6.3.3_amd64.deb
 
-        # Broker résilient pour cluster
-        broker_connection_retry_on_startup=True,
-        broker_connection_retry=True,
-        broker_connection_max_retries=100,
-        broker_transport_options={
-            'visibility_timeout': 3600,  # Important pour cluster
-            'fanout_prefix': True,
-            'fanout_patterns': True,
-            'global_keyprefix': 'celery:',
-            'socket_keepalive': True,
-            'retry_on_timeout': True,
-            'max_connections': 10
+# Ou installation depuis les sources
+git clone https://github.com/Snapchat/keydb-proxy.git
+cd keydb-proxy
+make
+sudo make install
+```
+
+### 2. **Configuration avec Authentification**
+
+```bash
+# Créer le répertoire de configuration
+sudo mkdir -p /etc/keydb /var/log/keydb /var/run/keydb
+
+# Configuration sécurisée
+sudo tee /etc/keydb/keydb-proxy.conf << 'EOF'
+# 🔐 Configuration KeyDB Proxy Sécurisée
+
+# Port du proxy
+proxy-port 7777
+bind 0.0.0.0
+
+# 🔑 Authentification côté client (si nécessaire)
+# requirepass VotreMotDePasseProxy
+
+# 🔒 Backend Redis Cluster avec authentification
+backend-host redis-node1
+backend-port 6379
+backend-auth VotreMotDePasseRedisSuperSecurise
+
+backend-host redis-node2  
+backend-port 6379
+backend-auth VotreMotDePasseRedisSuperSecurise
+
+backend-host redis-node3
+backend-port 6379
+backend-auth VotreMotDePasseRedisSuperSecurise
+
+# 🏗️ Mode Cluster
+cluster-mode yes
+cluster-node-timeout 15000
+
+# 📊 Monitoring et logs
+log-level notice
+logfile /var/log/keydb/proxy.log
+syslog-enabled yes
+
+# 🚀 Performance
+threads 4
+maxclients 10000
+timeout 300
+
+# 🔄 Persistence des connexions
+keepalive 60
+tcp-keepalive 60
+
+# 🛡️ Sécurité
+protected-mode no
+
+# 📈 Statistiques
+latency-monitor-threshold 100
+slowlog-log-slower-than 10000
+slowlog-max-len 128
+
+# 🎯 Mode démon
+daemonize yes
+pidfile /var/run/keydb/proxy.pid
+
+# 🔍 Debug (à désactiver en production)
+# log-level debug
+EOF
+```
+
+### 3. **Service Systemd Sécurisé**
+
+```bash
+# Créer le service systemd
+sudo tee /etc/systemd/system/keydb-proxy.service << 'EOF'
+[Unit]
+Description=KeyDB Proxy for Redis Cluster
+Documentation=https://docs.keydb.dev
+After=network.target
+
+[Service]
+Type=simple
+User=keydb
+Group=keydb
+RuntimeDirectory=keydb
+RuntimeDirectoryMode=0755
+
+# Configuration
+ExecStart=/usr/bin/keydb-proxy /etc/keydb/keydb-proxy.conf
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Sécurité
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/keydb /var/run/keydb
+
+# Restarts
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+### 4. **Configuration des Permissions et Utilisateur**
+
+```bash
+# Créer l'utilisateur dédié
+sudo useradd -r -s /bin/false keydb
+
+# Donner les permissions
+sudo mkdir -p /var/log/keydb /var/run/keydb
+sudo chown -R keydb:keydb /var/log/keydb /var/run/keydb /etc/keydb
+
+# Permissions sécurisées
+sudo chmod 750 /var/log/keydb /var/run/keydb
+sudo chmod 640 /etc/keydb/keydb-proxy.conf
+```
+
+### 5. **Démarrage et Activation**
+
+```bash
+# Recharger systemd
+sudo systemctl daemon-reload
+
+# Démarrer le service
+sudo systemctl enable keydb-proxy
+sudo systemctl start keydb-proxy
+
+# Vérifier le statut
+sudo systemctl status keydb-proxy
+
+# Vérifier les logs
+sudo journalctl -u keydb-proxy -f
+```
+
+### 6. **Test de Connexion Sécurisée**
+
+```bash
+# Test sans auth (devrait échouer si requirepass activé)
+redis-cli -p 7777 PING
+
+# Test avec auth (si requirepass activé côté proxy)
+redis-cli -p 7777 -a VotreMotDePasseProxy PING
+
+# Test complet avec données
+redis-cli -p 7777 SET test_key "hello"
+redis-cli -p 7777 GET test_key
+```
+
+## 🔧 **Configuration Adaptée pour Ton Cas**
+
+### **A. Si ton cluster Redis a le même mot de passe partout :**
+
+```bash
+# Configuration simple - même mot de passe pour tous les nœuds
+backend-host redis-node1
+backend-port 6379
+backend-auth MonMotDePasseRedisUnique
+
+backend-host redis-node2  
+backend-port 6379
+backend-auth MonMotDePasseRedisUnique
+
+backend-host redis-node3
+backend-port 6379
+backend-auth MonMotDePasseRedisUnique
+```
+
+### **B. Si tes nœuds Redis ont des mots de passe différents :**
+
+```bash
+# Configuration avec mots de passe différents (plus complexe)
+backend-host redis-node1
+backend-port 6379
+backend-auth MotDePasseNode1
+
+backend-host redis-node2  
+backend-port 6379
+backend-auth MotDePasseNode2
+
+backend-host redis-node3
+backend-port 6379
+backend-auth MotDePasseNode3
+```
+
+### **C. Configuration avec authentification côté proxy (recommandée) :**
+
+```bash
+# Ajouter dans keydb-proxy.conf
+requirepass VotreMotDePasseProxySuperSecurise
+
+# Et garder l'authentification backend
+backend-auth VotreMotDePasseRedis
+```
+
+## 🔄 **Mise à Jour de Ta Configuration Python**
+
+```python
+# config.py
+class Config:
+    # ✅ Broker via proxy avec authentification
+    CELERY_BROKER_URL = 'redis://:VotreMotDePasseProxySuperSecurise@localhost:7777/0'
+    
+    # ✅ Backend via le même proxy
+    CELERY_RESULT_BACKEND = 'redis://:VotreMotDePasseProxySuperSecurise@localhost:7777/1'
+    
+    # ✅ RedisManager en mode cluster DIRECT (sans proxy)
+    REDIS_CLUSTER_MODE = True
+    REDIS_CLUSTER_NODES = [
+        {
+            "host": "redis-node1", 
+            "port": 6379,
+            "password": "VotreMotDePasseRedisSuperSecurise"
         },
-
-        # Sérialisation
-        task_serializer='json',
-        result_serializer='json',
-        accept_content=['json'],
-        result_expires=timedelta(hours=6),
-
-        # Events
-        worker_send_task_events=True,
-        task_send_sent_event=True,
-        
-        # 🔥 CONFIGURATION BEAT POUR REDIS CLUSTER
-        beat_max_loop_interval=30,  # Vérification plus fréquente
-        beat_sync_every=1,  # Synchronisation immédiate
-    )
-
-    # ---- RedBeat Scheduler (RECOMMANDÉ pour cluster)
-    if getattr(Config, 'REDBEAT_ENABLED', True):
-        celery_app.conf.update(
-            beat_scheduler='redbeat.RedBeatScheduler',
-            redbeat_redis_url=Config.CELERY_BROKER_URL,
-            redbeat_key_prefix='redbeat:',
-            redbeat_lock_key='redbeat:lock',
-            redbeat_lock_timeout=60,  # Verrou de 60s
-        )
-        logger.info("RedBeat scheduler configured for Redis Cluster")
-    else:
-        # Scheduler par défaut (moins recommandé pour cluster)
-        celery_app.conf.beat_schedule = {
-            'process-scheduled-steps-every-5min': {
-                'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
-                'schedule': timedelta(seconds=300),
-                'options': {'queue': 'beat_tasks'}
-            },
-            'distributed-health-check': {
-                'task': 'workflow.celery_app.distributed_health_check',
-                'schedule': timedelta(seconds=60),
-                'options': {'queue': 'beat_tasks'}
-            }
-        }
-
-    # ---- Files d'attente
-    default_ex = Exchange('default', type='direct')
-    beat_ex = Exchange('beat', type='direct')
-    high_ex = Exchange('high_priority', type='direct')
-
-    celery_app.conf.task_queues = (
-        Queue('high_priority', high_ex, routing_key='high_priority',
-              queue_arguments={'x-max-priority': 10}),
-        Queue('beat_tasks', beat_ex, routing_key='beat.process'),
-        Queue('default', default_ex, routing_key='default'),
-    )
-
-    celery_app.conf.task_default_queue = 'default'
-    celery_app.conf.task_default_exchange = 'default'
-    celery_app.conf.task_default_routing_key = 'default'
-
-    celery_app.conf.task_routes = {
-        'workflow.tasks.core.scheduler.process_scheduled_steps': {
-            'queue': 'beat_tasks', 
-            'routing_key': 'beat.process'
+        {
+            "host": "redis-node2", 
+            "port": 6379,
+            "password": "VotreMotDePasseRedisSuperSecurise"  
         },
-        'workflow.tasks.operations.escalate.send_escalate_task': {
-            'queue': 'high_priority', 
-            'routing_key': 'high_priority', 
-            'priority': 9
+        {
+            "host": "redis-node3", 
+            "port": 6379,
+            "password": "VotreMotDePasseRedisSuperSecurise"
         },
-        'workflow.tasks.operations.reminder.send_reminder_task': {
-            'queue': 'default', 
-            'routing_key': 'default', 
-            'priority': 5
-        },
-    }
+    ]
+```
 
-    # ---- Contexte Flask pour toutes les tasks
-    class FlaskContextTask(celery_app.Task):
-        def __call__(self, *args, **kwargs):
-            with flask_app.app_context():
-                return super().__call__(*args, **kwargs)
+## 🛠️ **Script de Déploiement Automatisé**
 
-        def on_failure(self, exc, task_id, args, kwargs, einfo):
-            logger.error(f"Task {task_id} failed: {exc}")
-            return super().on_failure(exc, task_id, args, kwargs, einfo)
+```bash
+#!/bin/bash
+# deploy_keydb_proxy_secure.sh
 
-    celery_app.Task = FlaskContextTask
+set -e
 
-    # ---- Signaux avec coordination
-    @worker_ready.connect
-    def worker_ready_handler(sender, **kw):
-        logger.info(f"Worker {sender.hostname} ready")
-        # Enregistrement du worker
-        try:
-            with flask_app.app_context():
-                flask_app.redis_client.register_server_heartbeat(sender.hostname)
-        except Exception as e:
-            logger.error(f"Failed to register worker heartbeat: {e}")
+echo "🔐 Déploiement sécurisé de KeyDB Proxy..."
 
-    @worker_shutdown.connect
-    def worker_shutdown_handler(sender, **kw):
-        logger.info(f"Worker {sender.hostname} shutting down")
-        # Nettoyage optionnel
-        try:
-            with flask_app.app_context():
-                # Le TTL gère automatiquement l'expiration
-                pass
-        except Exception as e:
-            logger.error(f"Error during worker shutdown: {e}")
+# Variables de configuration
+REDIS_PASSWORD="VotreMotDePasseRedisSuperSecurise"
+PROXY_PASSWORD="VotreMotDePasseProxySuperSecurise"
+REDIS_NODES=("redis-node1" "redis-node2" "redis-node3")
+PROXY_PORT="7777"
 
-    return celery_app
+# Installation
+echo "📦 Installation de KeyDB Proxy..."
+wget -q https://download.keydb.dev/pkg/keydb-proxy_6.3.3_amd64.deb -O keydb-proxy.deb
+sudo dpkg -i keydb-proxy.deb || sudo apt-get install -f -y
+rm keydb-proxy.deb
 
-# Initialisation
-flask_app = create_app(Config)
-celery_app = make_celery(flask_app)
+# Configuration
+echo "⚙️  Configuration sécurisée..."
+sudo mkdir -p /etc/keydb /var/log/keydb /var/run/keydb
+
+# Génération du fichier de configuration
+sudo tee /etc/keydb/keydb-proxy.conf > /dev/null << EOF
+proxy-port ${PROXY_PORT}
+bind 0.0.0.0
+requirepass ${PROXY_PASSWORD}
+
+$(for node in "${REDIS_NODES[@]}"; do
+echo "backend-host ${node}"
+echo "backend-port 6379"  
+echo "backend-auth ${REDIS_PASSWORD}"
+done)
+
+cluster-mode yes
+cluster-node-timeout 15000
+log-level notice
+logfile /var/log/keydb/proxy.log
+daemonize yes
+pidfile /var/run/keydb/proxy.pid
+threads 4
+maxclients 10000
+EOF
+
+# Configuration utilisateur et permissions
+echo "🔒 Configuration des permissions..."
+sudo useradd -r -s /bin/false keydb 2>/dev/null || true
+sudo chown -R keydb:keydb /var/log/keydb /var/run/keydb /etc/keydb
+sudo chmod 750 /var/log/keydb /var/run/keydb
+sudo chmod 640 /etc/keydb/keydb-proxy.conf
+
+# Service systemd
+echo "🚀 Configuration du service..."
+sudo tee /etc/systemd/system/keydb-proxy.service > /dev/null << 'EOF'
+[Unit]
+Description=KeyDB Proxy for Redis Cluster
+After=network.target
+
+[Service]
+Type=simple
+User=keydb
+Group=keydb
+ExecStart=/usr/bin/keydb-proxy /etc/keydb/keydb-proxy.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Démarrage
+echo "🎯 Démarrage du service..."
+sudo systemctl daemon-reload
+sudo systemctl enable keydb-proxy
+sudo systemctl start keydb-proxy
+
+# Vérification
+echo "🔍 Vérification..."
+sleep 3
+if sudo systemctl is-active --quiet keydb-proxy; then
+    echo "✅ KeyDB Proxy démarré avec succès"
+    
+    # Test de connexion
+    if redis-cli -p ${PROXY_PORT} -a ${PROXY_PASSWORD} PING | grep -q "PONG"; then
+        echo "✅ Connexion au proxy fonctionnelle"
+    else
+        echo "❌ Erreur de connexion au proxy"
+        exit 1
+    fi
+else
+    echo "❌ Erreur lors du démarrage de KeyDB Proxy"
+    sudo journalctl -u keydb-proxy -n 20 --no-pager
+    exit 1
+fi
+
+echo "🎉 Déploiement sécurisé terminé avec succès!"
+```
+
+## 🔍 **Monitoring et Logs**
+
+```bash
+# Vérifier le statut
+sudo systemctl status keydb-proxy
+
+# Logs en temps réel
+sudo journalctl -u keydb-proxy -f
+
+# Logs détaillés
+sudo tail -f /var/log/keydb/proxy.log
+
+# Métriques de performance
+redis-cli -p 7777 -a VotreMotDePasseProxy INFO
+```
+
+## 🛡️ **Sécurité Additionnelle**
+
+### **Firewall (UFW) :**
+```bash
+# Autoriser uniquement les IPs des serveurs applicatifs
+sudo ufw allow from 192.168.1.10 to any port 7777
+sudo ufw allow from 192.168.1.11 to any port 7777
+```
+
+### **Configuration SSL (optionnel) :**
+```bash
+# Ajouter dans keydb-proxy.conf
+tls-port 7788
+tls-cert-file /etc/ssl/certs/keydb-proxy.crt
+tls-key-file /etc/ssl/private/keydb-proxy.key
+tls-ca-cert-file /etc/ssl/certs/ca.crt
+```
+
+## 🎯 **Cette configuration te donne :**
+
+- ✅ **Accès sécurisé** avec authentification
+- ✅ **Transparent pour Celery** (via proxy)
+- ✅ **Haute performance** avec 4 threads
+- ✅ **Monitoring complet** avec logs
+- ✅ **Service systemd** managé
+- ✅ **Sécurité renforcée** avec firewall
+
+**Ton architecture est maintenant sécurisée et simplifiée !** 🚀
+
+Teste-la et dis-moi si tout fonctionne !
