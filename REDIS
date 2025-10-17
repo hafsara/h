@@ -1,230 +1,1105 @@
-Parfait Hafsa 👏
-Je vois que ton playbook est déjà **très bien structuré** — tu as :
-
-* une séparation claire entre `redis.conf.j2` / `sentinel.conf.j2`,
-* des handlers pour redémarrer les services,
-* et une structure adaptée à un déploiement automatisé (Ansible pro, bravo 💪).
-
-Je vais t’indiquer **exactement les modifications à faire** pour transformer ton playbook actuel en **architecture Redis + Sentinel HA**, compatible avec **Celery** — sans casser ta logique existante.
-
----
-
-## 🧩 Objectif final
-
-Sur **chaque serveur Redis** :
-
-* 1 fichier `redis.conf`
-* 1 fichier `sentinel.conf`
-* 2 services distincts :
-
-  * `redis_master.service` ou `redis_replica.service`
-  * `redis_sentinel.service`
-
----
-
-## ⚙️ Étape 1 — Structure `hosts.yml`
-
-Tu es déjà presque bonne :
-
-```yaml
-redis:
-  hosts:
-    eurvlii333435.xmp.net.intra:
-      master: yes
-      replica: no
-    eurvlii333455.xmp.net.intra:
-      master: no
-      replica: yes
-    eurvlii333906.xmp.net.intra:
-      master: no
-      replica: yes
-```
-
-✅ garde exactement cette structure.
-C’est ce que tes templates utiliseront pour savoir qui configure quoi.
-
----
-
-## ⚙️ Étape 2 — Adapter `redis.conf.j2`
-
-Tu dois différencier master / replica :
-
-```jinja
-# redis.conf.j2
-port 6379
-bind 0.0.0.0
-daemonize yes
-protected-mode no
-dir {{ app_dir }}/data
-logfile {{ app_dir }}/logs/redis.log
-
-requirepass {{ vault.redis.password }}
-masterauth {{ vault.redis.password }}
-
-{% if node.status == 'master' %}
-# Master
-{% else %}
-# Replica
-replicaof {{ hostvars[groups['redis'][0]]['ansible_host'] | default(groups['redis'][0]) }} 6379
-{% endif %}
-```
-
-➡️ Le bloc `replicaof` pointe toujours vers ton **premier host (le master)**.
-
----
-
-## ⚙️ Étape 3 — Créer `sentinel.conf.j2`
-
-Ton template doit être le même pour tous les nœuds :
-
-```jinja
-port 26379
-bind 0.0.0.0
-daemonize yes
-dir {{ app_dir }}/data
-logfile {{ app_dir }}/logs/sentinel.log
-
-sentinel monitor mymaster {{ hostvars[groups['redis'][0]]['ansible_host'] | default(groups['redis'][0]) }} 6379 2
-sentinel auth-pass mymaster {{ vault.redis.password }}
-sentinel down-after-milliseconds mymaster 5000
-sentinel failover-timeout mymaster 10000
-sentinel parallel-syncs mymaster 1
-```
-
----
-
-## ⚙️ Étape 4 — Créer un service `redis-sentinel.service.j2`
-
-Ajoute un nouveau template :
-`roles/redis/templates/redis-sentinel.service.j2`
-
-```ini
-[Unit]
-Description=Redis Sentinel Service
-After=network.target
-
-[Service]
-ExecStart={{ app_dir }}/bin/redis-sentinel {{ app_dir }}/conf/sentinel.conf
-ExecStop=/bin/kill -s TERM $MAINPID
-Restart=always
-User={{ service_account }}
-
-[Install]
-WantedBy=multi-user.target
-```
-
----
-
-## ⚙️ Étape 5 — Modifier ton `configure.yml`
-
-Tu as déjà :
-
-```yaml
-- src: redis.conf.j2
-- src: sentinel.conf.j2
-```
-
-Ajoute maintenant aussi :
-
-```yaml
-- src: redis-sentinel.service.j2
-  dest: "/usr/lib/systemd/system/redis-sentinel.service"
-  mode: "0644"
-```
-
-et ajoute dans la même tâche :
-
-```yaml
-- name: enable redis-sentinel service
-  shell: |
-    systemctl daemon-reload
-    systemctl enable redis-sentinel
-    systemctl restart redis-sentinel
-  become: yes
-```
-
----
-
-## ⚙️ Étape 6 — Modifier tes handlers
-
-Tu as actuellement :
-
-```yaml
-- name: restart redis master
-  shell: sudo systemctl restart redis_master
-```
-
-Ajoute un handler pour le sentinel :
-
-```yaml
-- name: restart redis sentinel
-  shell: sudo systemctl restart redis-sentinel
-  become: yes
-```
-
-et notifie-le depuis `configure.yml` :
-
-```yaml
-notify:
-  - restart redis {{ node.status }}
-  - restart redis sentinel
-```
-
----
-
-## ⚙️ Étape 7 — Vérification Ansible
-
-Quand tu feras ton run :
-
-```bash
-ansible-playbook -i stg/hosts.yml redis.yml
-```
-
-Tu dois voir :
-
-* Création de `/etc/systemd/system/redis-sentinel.service`
-* Installation de `redis.conf` et `sentinel.conf` sur les 3 serveurs
-* Redémarrage de :
-
-  * `redis_master` sur 1 serveur
-  * `redis_replica` sur 2 serveurs
-  * `redis-sentinel` sur les 3
-
----
-
-## ✅ Vérification manuelle
-
-Sur chaque serveur :
-
-```bash
-systemctl status redis*
-```
-
-Doit montrer :
-
-```
-redis_master.service     active (running)
-redis-sentinel.service   active (running)
-```
-
-et côté Redis CLI :
-
-```bash
-redis-cli -p 26379 info Sentinel | grep master
-```
-
-doit afficher ton `mymaster` avec un seul master et deux replicas.
-
----
-
-## 💡 Résumé visuel
-
-| Serveur          | Fichiers                  | Services actifs               |
-| ---------------- | ------------------------- | ----------------------------- |
-| redis1 (master)  | redis.conf, sentinel.conf | redis_master, redis-sentinel  |
-| redis2 (replica) | redis.conf, sentinel.conf | redis_replica, redis-sentinel |
-| redis3 (replica) | redis.conf, sentinel.conf | redis_replica, redis-sentinel |
-
----
-
-Souhaites-tu que je te génère **les fichiers complets finaux (`redis.conf.j2`, `sentinel.conf.j2`, `redis-sentinel.service.j2`)** prêts à coller dans ton `roles/redis/templates/` ?
+# workflow/redis_manager.py
+import redis
+from redis.sentinel import Sentinel
+from datetime import timedelta, datetime
+import logging
+import uuid
+import time
+from contextlib import contextmanager
+from typing import Optional, List, Dict, Any, Union
+import socket
+
+logger = logging.getLogger(__name__)
+
+class RedisManager:
+    """
+    Manager Redis optimisé pour Redis Sentinel
+    Supporte la haute disponibilité avec failover automatique
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self._sentinel = None
+        self._master_client = None
+        self._slave_client = None
+        self._service_name = getattr(config, 'REDIS_SENTINEL_SERVICE_NAME', 'mymaster')
+        self._sentinel_hosts = getattr(config, 'REDIS_SENTINEL_HOSTS', [])
+        self._password = getattr(config, 'REDIS_PASSWORD', None)
+        self._socket_timeout = getattr(config, 'REDIS_SOCKET_TIMEOUT', 5)
+        
+    @property
+    def sentinel(self):
+        """Client Sentinel lazy-loaded"""
+        if self._sentinel is None:
+            self._sentinel = self._create_sentinel()
+        return self._sentinel
+    
+    @property
+    def master(self):
+        """Client Redis master lazy-loaded"""
+        if self._master_client is None:
+            self._master_client = self._get_master_client()
+        return self._master_client
+    
+    @property
+    def slave(self):
+        """Client Redis slave lazy-loaded (pour les lectures)"""
+        if self._slave_client is None:
+            self._slave_client = self._get_slave_client()
+        return self._slave_client
+    
+    def _create_sentinel(self) -> Sentinel:
+        """Crée le client Sentinel"""
+        try:
+            logger.info(f"Initializing Redis Sentinel with hosts: {self._sentinel_hosts}")
+            
+            sentinel = Sentinel(
+                self._sentinel_hosts,
+                socket_timeout=self._socket_timeout,
+                password=self._password,
+                decode_responses=True,
+                retry_on_timeout=True,
+                sentinel_kwargs={
+                    'password': self._password,
+                    'socket_timeout': self._socket_timeout
+                }
+            )
+            
+            # Test de connexion
+            sentinel.discover_master(self._service_name)
+            logger.info("✅ Redis Sentinel initialized successfully")
+            
+            return sentinel
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to create Redis Sentinel: {e}")
+            raise
+    
+    def _get_master_client(self) -> redis.Redis:
+        """Récupère le client Redis master"""
+        try:
+            master = self.sentinel.master_for(
+                self._service_name,
+                socket_timeout=self._socket_timeout,
+                password=self._password,
+                decode_responses=True,
+                retry_on_timeout=True
+            )
+            
+            # Test de connexion
+            master.ping()
+            logger.info("✅ Redis Master client connected")
+            
+            return master
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to Redis Master: {e}")
+            raise
+    
+    def _get_slave_client(self) -> redis.Redis:
+        """Récupère un client Redis slave (pour lectures)"""
+        try:
+            slave = self.sentinel.slave_for(
+                self._service_name,
+                socket_timeout=self._socket_timeout,
+                password=self._password,
+                decode_responses=True,
+                retry_on_timeout=True
+            )
+            
+            # Test de connexion
+            slave.ping()
+            logger.info("✅ Redis Slave client connected")
+            
+            return slave
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to connect to Redis Slave, falling back to master: {e}")
+            return self.master  # Fallback sur master
+    
+    def _refresh_connection_if_needed(self):
+        """Rafraîchit les connexions si nécessaire"""
+        try:
+            self.master.ping()
+        except (redis.ConnectionError, redis.ResponseError):
+            logger.warning("🔄 Redis Master connection lost, refreshing...")
+            self._master_client = None
+            self._slave_client = None
+    
+    # 🔥 OPÉRATIONS DE BASE AVEC SENTINEL
+    def setex(self, key: str, ttl: timedelta, value: str) -> bool:
+        """SETEX sur le master"""
+        try:
+            self._refresh_connection_if_needed()
+            return self.master.setex(key, int(ttl.total_seconds()), value)
+        except Exception as e:
+            logger.error(f"Redis SETEX error for key {key}: {e}")
+            raise
+    
+    def get(self, key: str, use_slave: bool = True) -> Optional[str]:
+        """GET - utilise le slave si disponible pour les lectures"""
+        try:
+            client = self.slave if use_slave else self.master
+            return client.get(key)
+        except Exception as e:
+            logger.error(f"Redis GET error for key {key}: {e}")
+            return None
+    
+    def keys(self, pattern: str, use_slave: bool = True) -> List[str]:
+        """KEYS avec fallback sur SCAN"""
+        try:
+            client = self.slave if use_slave else self.master
+            
+            # Utilise SCAN pour éviter de bloquer Redis
+            keys = []
+            cursor = 0
+            while True:
+                cursor, found_keys = client.scan(
+                    cursor=cursor, 
+                    match=pattern, 
+                    count=100
+                )
+                keys.extend(found_keys)
+                if cursor == 0:
+                    break
+            return keys
+            
+        except Exception as e:
+            logger.error(f"Redis KEYS/SCAN error for pattern {pattern}: {e}")
+            return []
+    
+    def xadd(self, stream: str, fields: Dict[str, Any], maxlen: Optional[int] = None) -> str:
+        """XADD sur le master"""
+        try:
+            self._refresh_connection_if_needed()
+            
+            kwargs = {}
+            if maxlen:
+                kwargs['maxlen'] = maxlen
+                kwargs['approximate'] = True
+            
+            return self.master.xadd(stream, fields, **kwargs)
+        except Exception as e:
+            logger.error(f"Redis XADD error for stream {stream}: {e}")
+            raise
+    
+    def xread(self, streams: Dict[str, str], count: Optional[int] = None, block: Optional[int] = None) -> Dict:
+        """XREAD - peut utiliser le slave pour les lectures"""
+        try:
+            client = self.slave  # Lectures sur slave si possible
+            
+            return client.xread(streams, count=count, block=block)
+        except Exception as e:
+            logger.error(f"Redis XREAD error for streams {streams}: {e}")
+            return {}
+    
+    def xdel(self, stream: str, *message_ids: str) -> int:
+        """XDEL sur le master"""
+        try:
+            self._refresh_connection_if_needed()
+            return self.master.xdel(stream, *message_ids)
+        except Exception as e:
+            logger.error(f"Redis XDEL error for stream {stream}: {e}")
+            return 0
+    
+    def xrange(self, stream: str, start: str = '-', end: str = '+', count: Optional[int] = None) -> List:
+        """XRANGE - utilise le slave pour les lectures"""
+        try:
+            client = self.slave
+            return client.xrange(stream, min=start, max=end, count=count)
+        except Exception as e:
+            logger.error(f"Redis XRANGE error for stream {stream}: {e}")
+            return []
+    
+    # 🔥 FONCTIONNALITÉS AVANCÉES
+    def json_set(self, key: str, path: str, obj: Any, ttl: Optional[timedelta] = None) -> bool:
+        """JSON.SET sur le master"""
+        try:
+            self._refresh_connection_if_needed()
+            
+            if hasattr(self.master, 'json_set'):
+                result = self.master.json_set(key, path, obj)
+                if result and ttl:
+                    self.master.expire(key, int(ttl.total_seconds()))
+                return result
+            else:
+                # Fallback si JSON non disponible
+                import json
+                result = self.master.set(key, json.dumps(obj))
+                if result and ttl:
+                    self.master.expire(key, int(ttl.total_seconds()))
+                return result
+        except Exception as e:
+            logger.error(f"Redis JSON.SET error for key {key}: {e}")
+            return False
+    
+    def json_get(self, key: str, path: str = '.') -> Optional[Any]:
+        """JSON.GET - utilise le slave pour les lectures"""
+        try:
+            client = self.slave
+            
+            if hasattr(client, 'json_get'):
+                return client.json_get(key, path)
+            else:
+                # Fallback
+                import json
+                data = client.get(key)
+                return json.loads(data) if data else None
+        except Exception as e:
+            logger.error(f"Redis JSON.GET error for key {key}: {e}")
+            return None
+    
+    # 🔥 LOCKS DISTRIBUÉS OPTIMISÉS POUR SENTINEL
+    def acquire_lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10) -> Optional[str]:
+        """Acquire a distributed lock avec gestion Sentinel"""
+        identifier = str(uuid.uuid4())
+        lock_key = f"lock:{lock_name}"
+        end_time = time.time() + acquire_timeout
+        
+        while time.time() < end_time:
+            try:
+                self._refresh_connection_if_needed()
+                
+                if self.master.set(lock_key, identifier, ex=timeout, nx=True):
+                    return identifier
+                time.sleep(0.1)  # 100ms
+            except Exception as e:
+                logger.error(f"Redis lock acquisition error for {lock_name}: {e}")
+                break
+        
+        return None
+    
+    def release_lock(self, lock_name: str, identifier: str) -> bool:
+        """Release lock seulement si owned par le current process"""
+        lock_key = f"lock:{lock_name}"
+        
+        lua_script = """
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+        """
+        
+        try:
+            self._refresh_connection_if_needed()
+            release_script = self.master.register_script(lua_script)
+            result = release_script(keys=[lock_key], args=[identifier])
+            return result == 1
+        except Exception as e:
+            logger.error(f"Redis lock release error for {lock_name}: {e}")
+            return False
+    
+    @contextmanager
+    def lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10):
+        """Context manager pour distributed locks avec Sentinel"""
+        identifier = self.acquire_lock(lock_name, timeout, acquire_timeout)
+        if not identifier:
+            raise Exception(f"Could not acquire lock: {lock_name}")
+        
+        try:
+            yield identifier
+        finally:
+            self.release_lock(lock_name, identifier)
+    
+    # 🔥 COORDINATION ET HA AVEC SENTINEL
+    def register_server_heartbeat(self, server_id: str, ttl: timedelta = timedelta(seconds=60)) -> bool:
+        """Enregistre un heartbeat de serveur sur le master"""
+        try:
+            self._refresh_connection_if_needed()
+            
+            key = f"servers:heartbeats"
+            pipeline = self.master.pipeline()
+            pipeline.hset(key, server_id, datetime.utcnow().isoformat())
+            pipeline.expire(key, int(ttl.total_seconds() * 2))
+            pipeline.execute()
+            return True
+        except Exception as e:
+            logger.error(f"Redis heartbeat registration error for server {server_id}: {e}")
+            return False
+    
+    def get_active_servers(self, max_age: timedelta = timedelta(seconds=45)) -> List[str]:
+        """Retourne les serveurs actifs - lecture sur slave"""
+        try:
+            key = f"servers:heartbeats"
+            heartbeats = self.slave.hgetall(key)
+            active_servers = []
+            current_time = datetime.utcnow()
+            
+            for server_id, heartbeat_str in heartbeats.items():
+                try:
+                    heartbeat_time = datetime.fromisoformat(heartbeat_str)
+                    if (current_time - heartbeat_time) < max_age:
+                        active_servers.append(server_id)
+                except ValueError:
+                    continue
+            
+            return sorted(active_servers)
+        except Exception as e:
+            logger.error(f"Redis get active servers error: {e}")
+            return []
+    
+    def is_server_leader(self, server_id: str) -> bool:
+        """Détermine si le serveur est le leader"""
+        active_servers = self.get_active_servers()
+        return bool(active_servers) and active_servers[0] == server_id
+    
+    # 🔥 INFORMATIONS SENTINEL
+    def get_sentinel_info(self) -> Dict[str, Any]:
+        """Récupère les informations du cluster Sentinel"""
+        try:
+            master_info = self.sentinel.discover_master(self._service_name)
+            slaves_info = self.sentinel.discover_slaves(self._service_name)
+            sentinels_info = self.sentinel.sentinels(self._service_name)
+            
+            return {
+                "master": master_info,
+                "slaves": slaves_info,
+                "sentinels": sentinels_info,
+                "service_name": self._service_name,
+                "sentinel_hosts": self._sentinel_hosts
+            }
+        except Exception as e:
+            logger.error(f"Failed to get Sentinel info: {e}")
+            return {"error": str(e)}
+    
+    def get_master_address(self) -> Optional[tuple]:
+        """Retourne l'adresse du master actuel"""
+        try:
+            return self.sentinel.discover_master(self._service_name)
+        except Exception as e:
+            logger.error(f"Failed to get master address: {e}")
+            return None
+    
+    def failover_status(self) -> Dict[str, Any]:
+        """Statut du failover Sentinel"""
+        try:
+            master_addr = self.get_master_address()
+            active_servers = self.get_active_servers()
+            
+            return {
+                "current_master": master_addr,
+                "active_servers": active_servers,
+                "total_servers": len(active_servers),
+                "is_healthy": master_addr is not None,
+                "server_id": getattr(self.config, 'SERVER_ID', 'unknown'),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "is_healthy": False,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+    
+    # 🔥 HEALTH CHECK COMPLET
+    def health_check(self) -> Dict[str, Any]:
+        """Vérifie la santé complète de Redis Sentinel"""
+        try:
+            start_time = time.time()
+            
+            # Test master
+            master_ping = self.master.ping()
+            master_info = self.master.info('server')
+            
+            # Test slave
+            slave_ping = self.slave.ping() if self._slave_client != self._master_client else True
+            
+            # Test Sentinel
+            sentinel_info = self.get_sentinel_info()
+            
+            response_time = (time.time() - start_time) * 1000
+            
+            return {
+                "status": "healthy",
+                "response_time_ms": round(response_time, 2),
+                "master": {
+                    "ping": master_ping,
+                    "version": master_info.get('redis_version', 'unknown'),
+                    "role": "master"
+                },
+                "slave": {
+                    "ping": slave_ping,
+                    "available": self._slave_client != self._master_client
+                },
+                "sentinel": {
+                    "service_name": self._service_name,
+                    "master_address": sentinel_info.get('master'),
+                    "slaves_count": len(sentinel_info.get('slaves', [])),
+                    "sentinels_count": len(sentinel_info.get('sentinels', []))
+                },
+                "failover_status": self.failover_status()
+            }
+            
+        except Exception as e:
+            logger.error(f"Redis Sentinel health check failed: {e}")
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+    
+    # 🔥 MÉTHODES UTILITAIRES
+    def flush_all(self) -> bool:
+        """Vide toutes les données (uniquement en dev)"""
+        if getattr(self.config, 'ENV', 'production') == 'production':
+            logger.error("🚨 FLUSH_ALL called in production! Operation blocked.")
+            return False
+        
+        try:
+            self._refresh_connection_if_needed()
+            return self.master.flushall()
+        except Exception as e:
+            logger.error(f"Redis FLUSHALL error: {e}")
+            return False
+    
+    def get_memory_info(self) -> Dict[str, Any]:
+        """Informations sur l'utilisation mémoire"""
+        try:
+            info = self.master.info('memory')
+            return {
+                "used_memory": info.get('used_memory', 0),
+                "used_memory_human": info.get('used_memory_human', '0B'),
+                "used_memory_peak": info.get('used_memory_peak', 0),
+                "used_memory_peak_human": info.get('used_memory_peak_human', '0B'),
+                "memory_fragmentation_ratio": info.get('mem_fragmentation_ratio', 0)
+            }
+        except Exception as e:
+            logger.error(f"Failed to get memory info: {e}")
+            return {"error": str(e)}
+
+
+
+# workflow/redis_manager.py
+import redis
+from redis.sentinel import Sentinel
+from datetime import timedelta, datetime
+import logging
+import uuid
+import time
+from contextlib import contextmanager
+from typing import Optional, List, Dict, Any, Union
+import socket
+
+logger = logging.getLogger(__name__)
+
+class RedisManager:
+    """
+    Manager Redis optimisé pour Redis Sentinel
+    Supporte la haute disponibilité avec failover automatique
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self._sentinel = None
+        self._master_client = None
+        self._slave_client = None
+        self._service_name = getattr(config, 'REDIS_SENTINEL_SERVICE_NAME', 'mymaster')
+        self._sentinel_hosts = getattr(config, 'REDIS_SENTINEL_HOSTS', [])
+        self._password = getattr(config, 'REDIS_PASSWORD', None)
+        self._socket_timeout = getattr(config, 'REDIS_SOCKET_TIMEOUT', 5)
+        self._retry_on_timeout = getattr(config, 'REDIS_RETRY_ON_TIMEOUT', True)
+
+    @property
+    def sentinel(self):
+        """Client Sentinel lazy-loaded"""
+        if self._sentinel is None:
+            self._sentinel = self._create_sentinel()
+        return self._sentinel
+
+    @property
+    def master(self):
+        """Client Redis master lazy-loaded"""
+        if self._master_client is None:
+            self._master_client = self._get_master_client()
+        return self._master_client
+
+    @property
+    def slave(self):
+        """Client Redis slave lazy-loaded (pour les lectures)"""
+        if self._slave_client is None:
+            self._slave_client = self._get_slave_client()
+        return self._slave_client
+
+    def _create_sentinel(self) -> Sentinel:
+        """Crée le client Sentinel"""
+        try:
+            logger.info(f"Initializing Redis Sentinel with hosts: {self._sentinel_hosts}")
+
+            sentinel = Sentinel(
+                self._sentinel_hosts,
+                socket_timeout=self._socket_timeout,
+                password=self._password,
+                decode_responses=True,
+                retry_on_timeout=self._retry_on_timeout,
+                sentinel_kwargs={
+                    'password': self._password,
+                    'socket_timeout': self._socket_timeout,
+                    'decode_responses': True
+                }
+            )
+
+            # Test de connexion en découvrant le master
+            master_info = sentinel.discover_master(self._service_name)
+            logger.info(f"✅ Redis Sentinel initialized successfully. Master: {master_info}")
+
+            return sentinel
+
+        except Exception as e:
+            logger.error(f"❌ Failed to create Redis Sentinel: {e}")
+            raise
+
+    def _get_master_client(self) -> redis.Redis:
+        """Récupère le client Redis master"""
+        try:
+            master = self.sentinel.master_for(
+                self._service_name,
+                socket_timeout=self._socket_timeout,
+                password=self._password,
+                decode_responses=True,
+                retry_on_timeout=self._retry_on_timeout,
+                socket_keepalive=True
+            )
+
+            # Test de connexion
+            master.ping()
+            logger.info("✅ Redis Master client connected")
+
+            return master
+
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to Redis Master: {e}")
+            raise
+
+    def _get_slave_client(self) -> redis.Redis:
+        """Récupère un client Redis slave (pour lectures)"""
+        try:
+            slave = self.sentinel.slave_for(
+                self._service_name,
+                socket_timeout=self._socket_timeout,
+                password=self._password,
+                decode_responses=True,
+                retry_on_timeout=self._retry_on_timeout,
+                socket_keepalive=True
+            )
+
+            # Test de connexion
+            slave.ping()
+            logger.info("✅ Redis Slave client connected")
+
+            return slave
+
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to connect to Redis Slave, falling back to master: {e}")
+            return self.master  # Fallback sur master
+
+    def _refresh_connection_if_needed(self):
+        """Rafraîchit les connexions si nécessaire"""
+        try:
+            self.master.ping()
+        except (redis.ConnectionError, redis.ResponseError, redis.TimeoutError):
+            logger.warning("🔄 Redis Master connection lost, refreshing connections...")
+            self._master_client = None
+            self._slave_client = None
+
+    def _ensure_master_connection(self):
+        """S'assure que la connexion master est active"""
+        self._refresh_connection_if_needed()
+
+    def _get_client_for_operation(self, operation_type: str = 'read'):
+        """Retourne le client approprié selon le type d'opération"""
+        if operation_type == 'write':
+            self._ensure_master_connection()
+            return self.master
+        else:
+            return self.slave
+
+    # 🔥 OPÉRATIONS DE BASE AVEC SENTINEL
+    def set(self, key: str, value: str, ttl: Optional[timedelta] = None) -> bool:
+        """SET sur le master"""
+        try:
+            self._ensure_master_connection()
+            if ttl:
+                return self.master.setex(key, int(ttl.total_seconds()), value)
+            else:
+                return self.master.set(key, value)
+        except Exception as e:
+            logger.error(f"Redis SET error for key {key}: {e}")
+            raise
+
+    def setex(self, key: str, ttl: timedelta, value: str) -> bool:
+        """SETEX sur le master"""
+        return self.set(key, value, ttl)
+
+    def get(self, key: str, use_slave: bool = True) -> Optional[str]:
+        """GET - utilise le slave si disponible pour les lectures"""
+        try:
+            client = self.slave if use_slave else self.master
+            return client.get(key)
+        except Exception as e:
+            logger.error(f"Redis GET error for key {key}: {e}")
+            return None
+
+    def delete(self, key: str) -> bool:
+        """DELETE sur le master"""
+        try:
+            self._ensure_master_connection()
+            return bool(self.master.delete(key))
+        except Exception as e:
+            logger.error(f"Redis DELETE error for key {key}: {e}")
+            return False
+
+    def exists(self, key: str) -> bool:
+        """EXISTS - utilise le slave pour les lectures"""
+        try:
+            return bool(self.slave.exists(key))
+        except Exception as e:
+            logger.error(f"Redis EXISTS error for key {key}: {e}")
+            return False
+
+    def expire(self, key: str, ttl: timedelta) -> bool:
+        """EXPIRE sur le master"""
+        try:
+            self._ensure_master_connection()
+            return self.master.expire(key, int(ttl.total_seconds()))
+        except Exception as e:
+            logger.error(f"Redis EXPIRE error for key {key}: {e}")
+            return False
+
+    def ttl(self, key: str) -> int:
+        """TTL - utilise le slave pour les lectures"""
+        try:
+            return self.slave.ttl(key)
+        except Exception as e:
+            logger.error(f"Redis TTL error for key {key}: {e}")
+            return -2
+
+    def keys(self, pattern: str, use_slave: bool = True) -> List[str]:
+        """KEYS avec fallback sur SCAN"""
+        try:
+            client = self.slave if use_slave else self.master
+
+            # Utilise SCAN pour éviter de bloquer Redis
+            keys = []
+            cursor = 0
+            while True:
+                cursor, found_keys = client.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=100
+                )
+                keys.extend(found_keys)
+                if cursor == 0:
+                    break
+            return keys
+
+        except Exception as e:
+            logger.error(f"Redis KEYS/SCAN error for pattern {pattern}: {e}")
+            return []
+
+    # 🔥 OPÉRATIONS SUR LES HASHES
+    def hset(self, key: str, field: str, value: str) -> bool:
+        """HSET sur le master"""
+        try:
+            self._ensure_master_connection()
+            return bool(self.master.hset(key, field, value))
+        except Exception as e:
+            logger.error(f"Redis HSET error for key {key}.{field}: {e}")
+            return False
+
+    def hget(self, key: str, field: str) -> Optional[str]:
+        """HGET - utilise le slave pour les lectures"""
+        try:
+            return self.slave.hget(key, field)
+        except Exception as e:
+            logger.error(f"Redis HGET error for key {key}.{field}: {e}")
+            return None
+
+    def hgetall(self, key: str) -> Dict[str, str]:
+        """HGETALL - utilise le slave pour les lectures"""
+        try:
+            return self.slave.hgetall(key)
+        except Exception as e:
+            logger.error(f"Redis HGETALL error for key {key}: {e}")
+            return {}
+
+    def hdel(self, key: str, *fields: str) -> int:
+        """HDEL sur le master"""
+        try:
+            self._ensure_master_connection()
+            return self.master.hdel(key, *fields)
+        except Exception as e:
+            logger.error(f"Redis HDEL error for key {key}: {e}")
+            return 0
+
+    # 🔥 OPÉRATIONS SUR LES STREAMS (pour Celery)
+    def xadd(self, stream: str, fields: Dict[str, Any], maxlen: Optional[int] = None) -> str:
+        """XADD sur le master"""
+        try:
+            self._ensure_master_connection()
+
+            kwargs = {}
+            if maxlen:
+                kwargs['maxlen'] = maxlen
+                kwargs['approximate'] = True
+
+            return self.master.xadd(stream, fields, **kwargs)
+        except Exception as e:
+            logger.error(f"Redis XADD error for stream {stream}: {e}")
+            raise
+
+    def xread(self, streams: Dict[str, str], count: Optional[int] = None, block: Optional[int] = None) -> Dict:
+        """XREAD - peut utiliser le slave pour les lectures"""
+        try:
+            client = self.slave  # Lectures sur slave si possible
+            return client.xread(streams, count=count, block=block)
+        except Exception as e:
+            logger.error(f"Redis XREAD error for streams {streams}: {e}")
+            return {}
+
+    def xdel(self, stream: str, *message_ids: str) -> int:
+        """XDEL sur le master"""
+        try:
+            self._ensure_master_connection()
+            return self.master.xdel(stream, *message_ids)
+        except Exception as e:
+            logger.error(f"Redis XDEL error for stream {stream}: {e}")
+            return 0
+
+    def xrange(self, stream: str, start: str = '-', end: str = '+', count: Optional[int] = None) -> List:
+        """XRANGE - utilise le slave pour les lectures"""
+        try:
+            client = self.slave
+            return client.xrange(stream, min=start, max=end, count=count)
+        except Exception as e:
+            logger.error(f"Redis XRANGE error for stream {stream}: {e}")
+            return []
+
+    # 🔥 OPÉRATIONS SUR LES SETS
+    def sadd(self, key: str, *members: str) -> int:
+        """SADD sur le master"""
+        try:
+            self._ensure_master_connection()
+            return self.master.sadd(key, *members)
+        except Exception as e:
+            logger.error(f"Redis SADD error for key {key}: {e}")
+            return 0
+
+    def smembers(self, key: str) -> set:
+        """SMEMBERS - utilise le slave pour les lectures"""
+        try:
+            return self.slave.smembers(key)
+        except Exception as e:
+            logger.error(f"Redis SMEMBERS error for key {key}: {e}")
+            return set()
+
+    def sismember(self, key: str, member: str) -> bool:
+        """SISMEMBER - utilise le slave pour les lectures"""
+        try:
+            return self.slave.sismember(key, member)
+        except Exception as e:
+            logger.error(f"Redis SISMEMBER error for key {key}: {e}")
+            return False
+
+    # 🔥 FONCTIONNALITÉS AVANCÉES
+    def json_set(self, key: str, path: str, obj: Any, ttl: Optional[timedelta] = None) -> bool:
+        """JSON.SET sur le master"""
+        try:
+            self._ensure_master_connection()
+
+            if hasattr(self.master, 'json_set'):
+                result = self.master.json_set(key, path, obj)
+                if result and ttl:
+                    self.master.expire(key, int(ttl.total_seconds()))
+                return result
+            else:
+                # Fallback si JSON non disponible
+                import json
+                result = self.master.set(key, json.dumps(obj))
+                if result and ttl:
+                    self.master.expire(key, int(ttl.total_seconds()))
+                return result
+        except Exception as e:
+            logger.error(f"Redis JSON.SET error for key {key}: {e}")
+            return False
+
+    def json_get(self, key: str, path: str = '.') -> Optional[Any]:
+        """JSON.GET - utilise le slave pour les lectures"""
+        try:
+            client = self.slave
+
+            if hasattr(client, 'json_get'):
+                return client.json_get(key, path)
+            else:
+                # Fallback
+                import json
+                data = client.get(key)
+                return json.loads(data) if data else None
+        except Exception as e:
+            logger.error(f"Redis JSON.GET error for key {key}: {e}")
+            return None
+
+    # 🔥 PIPELINE POUR LES OPÉRATIONS MULTIPLES
+    def pipeline(self):
+        """Retourne un pipeline pour les opérations multiples"""
+        self._ensure_master_connection()
+        return self.master.pipeline()
+
+    # 🔥 LOCKS DISTRIBUÉS OPTIMISÉS POUR SENTINEL
+    def acquire_lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10) -> Optional[str]:
+        """Acquire a distributed lock avec gestion Sentinel"""
+        identifier = str(uuid.uuid4())
+        lock_key = f"lock:{lock_name}"
+        end_time = time.time() + acquire_timeout
+
+        while time.time() < end_time:
+            try:
+                self._ensure_master_connection()
+
+                if self.master.set(lock_key, identifier, ex=timeout, nx=True):
+                    return identifier
+                time.sleep(0.1)  # 100ms
+            except Exception as e:
+                logger.error(f"Redis lock acquisition error for {lock_name}: {e}")
+                break
+
+        return None
+
+    def release_lock(self, lock_name: str, identifier: str) -> bool:
+        """Release lock seulement si owned par le current process"""
+        lock_key = f"lock:{lock_name}"
+
+        lua_script = """
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+        """
+
+        try:
+            self._ensure_master_connection()
+            release_script = self.master.register_script(lua_script)
+            result = release_script(keys=[lock_key], args=[identifier])
+            return result == 1
+        except Exception as e:
+            logger.error(f"Redis lock release error for {lock_name}: {e}")
+            return False
+
+    @contextmanager
+    def lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10):
+        """Context manager pour distributed locks avec Sentinel"""
+        identifier = self.acquire_lock(lock_name, timeout, acquire_timeout)
+        if not identifier:
+            raise Exception(f"Could not acquire lock: {lock_name}")
+
+        try:
+            yield identifier
+        finally:
+            self.release_lock(lock_name, identifier)
+
+    # 🔥 COORDINATION ET HA AVEC SENTINEL
+    def register_server_heartbeat(self, server_id: str, ttl: timedelta = timedelta(seconds=60)) -> bool:
+        """Enregistre un heartbeat de serveur sur le master"""
+        try:
+            self._ensure_master_connection()
+
+            key = f"servers:heartbeats"
+            pipeline = self.master.pipeline()
+            pipeline.hset(key, server_id, datetime.utcnow().isoformat())
+            pipeline.expire(key, int(ttl.total_seconds() * 2))
+            pipeline.execute()
+            return True
+        except Exception as e:
+            logger.error(f"Redis heartbeat registration error for server {server_id}: {e}")
+            return False
+
+    def get_active_servers(self, max_age: timedelta = timedelta(seconds=45)) -> List[str]:
+        """Retourne les serveurs actifs - lecture sur slave"""
+        try:
+            key = f"servers:heartbeats"
+            heartbeats = self.slave.hgetall(key)
+            active_servers = []
+            current_time = datetime.utcnow()
+
+            for server_id, heartbeat_str in heartbeats.items():
+                try:
+                    heartbeat_time = datetime.fromisoformat(heartbeat_str)
+                    if (current_time - heartbeat_time) < max_age:
+                        active_servers.append(server_id)
+                except ValueError:
+                    continue
+
+            return sorted(active_servers)
+        except Exception as e:
+            logger.error(f"Redis get active servers error: {e}")
+            return []
+
+    def is_server_leader(self, server_id: str) -> bool:
+        """Détermine si le serveur est le leader"""
+        active_servers = self.get_active_servers()
+        return bool(active_servers) and active_servers[0] == server_id
+
+    # 🔥 INFORMATIONS SENTINEL
+    def get_sentinel_info(self) -> Dict[str, Any]:
+        """Récupère les informations du cluster Sentinel"""
+        try:
+            master_info = self.sentinel.discover_master(self._service_name)
+            slaves_info = self.sentinel.discover_slaves(self._service_name)
+            sentinels_info = self.sentinel.sentinels(self._service_name)
+
+            return {
+                "master": {
+                    "host": master_info[0],
+                    "port": master_info[1]
+                },
+                "slaves": [
+                    {"host": slave[0], "port": slave[1]} for slave in slaves_info
+                ],
+                "sentinels_count": len(sentinels_info),
+                "service_name": self._service_name,
+                "sentinel_hosts": self._sentinel_hosts
+            }
+        except Exception as e:
+            logger.error(f"Failed to get Sentinel info: {e}")
+            return {"error": str(e)}
+
+    def get_master_address(self) -> Optional[tuple]:
+        """Retourne l'adresse du master actuel"""
+        try:
+            return self.sentinel.discover_master(self._service_name)
+        except Exception as e:
+            logger.error(f"Failed to get master address: {e}")
+            return None
+
+    def failover_status(self) -> Dict[str, Any]:
+        """Statut du failover Sentinel"""
+        try:
+            master_addr = self.get_master_address()
+            active_servers = self.get_active_servers()
+
+            return {
+                "current_master": f"{master_addr[0]}:{master_addr[1]}" if master_addr else None,
+                "active_servers": active_servers,
+                "total_servers": len(active_servers),
+                "is_healthy": master_addr is not None,
+                "server_id": getattr(self.config, 'SERVER_ID', 'unknown'),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "is_healthy": False,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+    # 🔥 HEALTH CHECK COMPLET
+    def health_check(self) -> Dict[str, Any]:
+        """Vérifie la santé complète de Redis Sentinel"""
+        try:
+            start_time = time.time()
+
+            # Test master
+            master_ping = self.master.ping()
+            master_info = self.master.info('server')
+
+            # Test slave
+            slave_ping = self.slave.ping() if self._slave_client != self._master_client else True
+
+            # Test Sentinel
+            sentinel_info = self.get_sentinel_info()
+
+            response_time = (time.time() - start_time) * 1000
+
+            health_data = {
+                "status": "healthy",
+                "response_time_ms": round(response_time, 2),
+                "master": {
+                    "ping": master_ping,
+                    "version": master_info.get('redis_version', 'unknown'),
+                    "role": "master",
+                    "connected": True
+                },
+                "slave": {
+                    "ping": slave_ping,
+                    "available": self._slave_client != self._master_client,
+                    "connected": True
+                },
+                "sentinel": sentinel_info,
+                "failover_status": self.failover_status()
+            }
+
+            # Vérifier si tout est healthy
+            if not all([master_ping, slave_ping, sentinel_info.get('master')]):
+                health_data["status"] = "degraded"
+
+            return health_data
+
+        except Exception as e:
+            logger.error(f"Redis Sentinel health check failed: {e}")
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+    # 🔥 MÉTHODES UTILITAIRES
+    def flush_all(self) -> bool:
+        """Vide toutes les données (uniquement en dev)"""
+        if getattr(self.config, 'ENV', 'production') == 'production':
+            logger.error("🚨 FLUSH_ALL called in production! Operation blocked.")
+            return False
+
+        try:
+            self._ensure_master_connection()
+            return self.master.flushall()
+        except Exception as e:
+            logger.error(f"Redis FLUSHALL error: {e}")
+            return False
+
+    def get_memory_info(self) -> Dict[str, Any]:
+        """Informations sur l'utilisation mémoire"""
+        try:
+            info = self.master.info('memory')
+            return {
+                "used_memory": info.get('used_memory', 0),
+                "used_memory_human": info.get('used_memory_human', '0B'),
+                "used_memory_peak": info.get('used_memory_peak', 0),
+                "used_memory_peak_human": info.get('used_memory_peak_human', '0B'),
+                "memory_fragmentation_ratio": info.get('mem_fragmentation_ratio', 0)
+            }
+        except Exception as e:
+            logger.error(f"Failed to get memory info: {e}")
+            return {"error": str(e)}
+
+    def get_cluster_info(self) -> Dict[str, Any]:
+        """Informations complètes sur le cluster"""
+        try:
+            sentinel_info = self.get_sentinel_info()
+            memory_info = self.get_memory_info()
+            health_info = self.health_check()
+
+            return {
+                "sentinel": sentinel_info,
+                "memory": memory_info,
+                "health": health_info,
+                "server_id": getattr(self.config, 'SERVER_ID', 'unknown'),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Failed to get cluster info: {e}")
+            return {"error": str(e)}
+
+    def close_connections(self):
+        """Ferme toutes les connexions Redis"""
+        try:
+            if self._master_client:
+                self._master_client.close()
+            if self._slave_client and self._slave_client != self._master_client:
+                self._slave_client.close()
+            self._master_client = None
+            self._slave_client = None
+            self._sentinel = None
+            logger.info("Redis connections closed")
+        except Exception as e:
+            logger.error(f"Error closing Redis connections: {e}")
