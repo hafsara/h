@@ -1,926 +1,813 @@
-Excellent Hafsa 👏
-Puisque tu as déjà **buildé Redis 8.2.2** (serveur + cli) — parfait 👌
-On va simplement automatiser **le déploiement Sentinel haute disponibilité (3 nœuds)** avec **Ansible**, sans utiliser les packages système.
-
----
-
-## 🎯 Objectif
-
-Déployer une architecture **Redis Sentinel 8.2.2 HA** sur **3 serveurs** :
-
-| Serveur  | Rôle Redis | Rôle Sentinel |
-| -------- | ---------- | ------------- |
-| **srv1** | Master     | Sentinel      |
-| **srv2** | Replica    | Sentinel      |
-| **srv3** | Replica    | Sentinel      |
-
-Les sentinels vont surveiller un master nommé `mymaster` avec mot de passe `S3cur3P@ss`.
-
----
-
-## 🗂️ Structure du playbook
-
-```
-ansible/
-├── inventory.ini
-├── deploy_redis_sentinel.yml
-└── roles/
-    └── redis_sentinel/
-        ├── tasks/
-        │   └── main.yml
-        ├── templates/
-        │   ├── redis.conf.j2
-        │   └── sentinel.conf.j2
-        └── files/
-            ├── redis-server
-            └── redis-cli
-```
-
----
-
-## 📋 1. **inventory.ini**
-
-```ini
-[redis_sentinel]
-srv1 ansible_host=10.0.0.1 redis_role=master
-srv2 ansible_host=10.0.0.2 redis_role=replica
-srv3 ansible_host=10.0.0.3 redis_role=replica
-```
-
----
-
-## 📋 2. **deploy_redis_sentinel.yml**
-
-```yaml
----
-- name: Deploy Redis 8.2.2 Sentinel Cluster
-  hosts: redis_sentinel
-  become: yes
-  vars:
-    redis_version: "8.2.2"
-    redis_install_dir: "/opt/redis-{{ redis_version }}"
-    redis_data_dir: "/var/lib/redis"
-    redis_log_dir: "/var/log/redis"
-    redis_conf_dir: "/etc/redis"
-    redis_user: "redis"
-    redis_port: 6379
-    sentinel_port: 26379
-    redis_password: "S3cur3P@ss"
-    redis_master_name: "mymaster"
-    redis_master_host: "10.0.0.1"
-
-  roles:
-    - redis_sentinel
-```
-
----
-
-## 📋 3. **roles/redis_sentinel/tasks/main.yml**
-
-```yaml
----
-- name: Ensure Redis user exists
-  ansible.builtin.user:
-    name: "{{ redis_user }}"
-    shell: /sbin/nologin
-    system: yes
-
-- name: Create directories
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: directory
-    owner: "{{ redis_user }}"
-    group: "{{ redis_user }}"
-    mode: "0755"
-  loop:
-    - "{{ redis_data_dir }}"
-    - "{{ redis_log_dir }}"
-    - "{{ redis_conf_dir }}"
-
-- name: Copy redis-server and redis-cli binaries
-  ansible.builtin.copy:
-    src: "{{ item }}"
-    dest: "/usr/local/bin/{{ item }}"
-    owner: root
-    group: root
-    mode: "0755"
-  loop:
-    - redis-server
-    - redis-cli
-
-- name: Generate redis.conf
-  ansible.builtin.template:
-    src: "redis.conf.j2"
-    dest: "{{ redis_conf_dir }}/redis.conf"
-    owner: "{{ redis_user }}"
-    group: "{{ redis_user }}"
-    mode: "0644"
-  notify: Restart Redis
-
-- name: Generate sentinel.conf
-  ansible.builtin.template:
-    src: "sentinel.conf.j2"
-    dest: "{{ redis_conf_dir }}/sentinel.conf"
-    owner: "{{ redis_user }}"
-    group: "{{ redis_user }}"
-    mode: "0644"
-  notify: Restart Sentinel
-
-- name: Create systemd service for redis
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/redis.service
-    content: |
-      [Unit]
-      Description=Redis Server
-      After=network.target
-
-      [Service]
-      User={{ redis_user }}
-      ExecStart=/usr/local/bin/redis-server {{ redis_conf_dir }}/redis.conf
-      ExecStop=/usr/local/bin/redis-cli -a {{ redis_password }} shutdown
-      Restart=always
-      LimitNOFILE=10000
-
-      [Install]
-      WantedBy=multi-user.target
-  notify: Restart Redis
-
-- name: Create systemd service for sentinel
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/redis-sentinel.service
-    content: |
-      [Unit]
-      Description=Redis Sentinel
-      After=network.target redis.service
-
-      [Service]
-      User={{ redis_user }}
-      ExecStart=/usr/local/bin/redis-sentinel {{ redis_conf_dir }}/sentinel.conf --daemonize no
-      Restart=always
-      LimitNOFILE=10000
-
-      [Install]
-      WantedBy=multi-user.target
-  notify: Restart Sentinel
-
-- name: Enable and start services
-  ansible.builtin.systemd:
-    name: "{{ item }}"
-    enabled: yes
-    state: started
-  loop:
-    - redis
-    - redis-sentinel
-
-# Handlers
-- name: Restart Redis
-  ansible.builtin.systemd:
-    name: redis
-    state: restarted
-    daemon_reload: yes
-
-- name: Restart Sentinel
-  ansible.builtin.systemd:
-    name: redis-sentinel
-    state: restarted
-    daemon_reload: yes
-```
-
----
-
-## 📋 4. **roles/redis_sentinel/templates/redis.conf.j2**
-
-```jinja
-bind 0.0.0.0
-port {{ redis_port }}
-protected-mode no
-
-dir {{ redis_data_dir }}
-logfile {{ redis_log_dir }}/redis.log
-dbfilename dump.rdb
-appendonly yes
-
-requirepass {{ redis_password }}
-masterauth {{ redis_password }}
-
-{% if redis_role == "replica" %}
-replicaof {{ redis_master_host }} {{ redis_port }}
-{% endif %}
-
-timeout 0
-tcp-keepalive 60
-```
-
----
-
-## 📋 5. **roles/redis_sentinel/templates/sentinel.conf.j2**
-
-```jinja
-port {{ sentinel_port }}
-bind 0.0.0.0
-protected-mode no
-daemonize no
-dir /tmp
-logfile {{ redis_log_dir }}/sentinel.log
-
-sentinel monitor {{ redis_master_name }} {{ redis_master_host }} {{ redis_port }} 2
-sentinel auth-pass {{ redis_master_name }} {{ redis_password }}
-sentinel down-after-milliseconds {{ redis_master_name }} 5000
-sentinel failover-timeout {{ redis_master_name }} 10000
-sentinel parallel-syncs {{ redis_master_name }} 1
-```
-
----
-
-## 🚀 6. **Déploiement**
-
-> ⚙️ Assure-toi d’avoir ton `redis-server` et `redis-cli` déjà compilés dans `roles/redis_sentinel/files/`.
-
-Puis lance :
-
-```bash
-ansible-playbook -i inventory.ini deploy_redis_sentinel.yml
-```
-
----
-
-## ✅ 7. **Vérifications post-déploiement**
-
-Sur n’importe quel nœud :
-
-```bash
-redis-cli -a S3cur3P@ss info replication
-```
-
-Tu dois voir :
-
-```
-role:master
-connected_slaves:2
-```
-
-Et côté Sentinel :
-
-```bash
-redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
-```
-
-Tu verras :
-
-```
-1) "10.0.0.1"
-2) "6379"
-```
-
----
-
-## 🧠 Bonus : Test de failover
-
-Simule un crash du master :
-
-```bash
-sudo systemctl stop redis
-sleep 10
-redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
-```
-
-Le nouveau master sera automatiquement **srv2** ou **srv3** 🔁
-
----
-
-Souhaites-tu que je te génère la **version avec failover monitoring via Prometheus exporter** (pour voir les bascules en live) ?
-👉 C’est souvent très utile en prod (et je peux te l’intégrer au même playbook).
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Voici le code du `RedisManager` adapté spécifiquement pour **Redis Sentinel** :
-
-## 🔥 **RedisManager pour Redis Sentinel**
-
-```python
-# workflow/redis_manager.py
-import redis
-from redis.sentinel import Sentinel
-from datetime import timedelta, datetime
-import logging
-import uuid
-import time
-from contextlib import contextmanager
-from typing import Optional, List, Dict, Any, Union
-import socket
-
-logger = logging.getLogger(__name__)
-
-class RedisManager:
-    """
-    Manager Redis optimisé pour Redis Sentinel
-    Supporte la haute disponibilité avec failover automatique
-    """
-
-    def __init__(self, config):
-        self.config = config
-        self._sentinel = None
-        self._master_client = None
-        self._slave_client = None
-        self._service_name = getattr(config, 'REDIS_SENTINEL_SERVICE_NAME', 'mymaster')
-        self._sentinel_hosts = getattr(config, 'REDIS_SENTINEL_HOSTS', [])
-        self._password = getattr(config, 'REDIS_PASSWORD', None)
-        self._socket_timeout = getattr(config, 'REDIS_SOCKET_TIMEOUT', 5)
-
-    @property
-    def sentinel(self):
-        """Client Sentinel lazy-loaded"""
-        if self._sentinel is None:
-            self._sentinel = self._create_sentinel()
-        return self._sentinel
-
-    @property
-    def master(self):
-        """Client Redis master lazy-loaded"""
-        if self._master_client is None:
-            self._master_client = self._get_master_client()
-        return self._master_client
-
-    @property
-    def slave(self):
-        """Client Redis slave lazy-loaded (pour les lectures)"""
-        if self._slave_client is None:
-            self._slave_client = self._get_slave_client()
-        return self._slave_client
-
-    def _create_sentinel(self) -> Sentinel:
-        """Crée le client Sentinel"""
-        try:
-            logger.info(f"Initializing Redis Sentinel with hosts: {self._sentinel_hosts}")
-
-            sentinel = Sentinel(
-                self._sentinel_hosts,
-                socket_timeout=self._socket_timeout,
-                password=self._password,
-                decode_responses=True,
-                retry_on_timeout=True,
-                sentinel_kwargs={
-                    'password': self._password,
-                    'socket_timeout': self._socket_timeout
-                }
-            )
-
-            # Test de connexion
-            sentinel.discover_master(self._service_name)
-            logger.info("✅ Redis Sentinel initialized successfully")
-
-            return sentinel
-
-        except Exception as e:
-            logger.error(f"❌ Failed to create Redis Sentinel: {e}")
-            raise
-
-    def _get_master_client(self) -> redis.Redis:
-        """Récupère le client Redis master"""
-        try:
-            master = self.sentinel.master_for(
-                self._service_name,
-                socket_timeout=self._socket_timeout,
-                password=self._password,
-                decode_responses=True,
-                retry_on_timeout=True
-            )
-
-            # Test de connexion
-            master.ping()
-            logger.info("✅ Redis Master client connected")
-
-            return master
-
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to Redis Master: {e}")
-            raise
-
-    def _get_slave_client(self) -> redis.Redis:
-        """Récupère un client Redis slave (pour lectures)"""
-        try:
-            slave = self.sentinel.slave_for(
-                self._service_name,
-                socket_timeout=self._socket_timeout,
-                password=self._password,
-                decode_responses=True,
-                retry_on_timeout=True
-            )
-
-            # Test de connexion
-            slave.ping()
-            logger.info("✅ Redis Slave client connected")
-
-            return slave
-
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to connect to Redis Slave, falling back to master: {e}")
-            return self.master  # Fallback sur master
-
-    def _refresh_connection_if_needed(self):
-        """Rafraîchit les connexions si nécessaire"""
-        try:
-            self.master.ping()
-        except (redis.ConnectionError, redis.ResponseError):
-            logger.warning("🔄 Redis Master connection lost, refreshing...")
-            self._master_client = None
-            self._slave_client = None
-
-    # 🔥 OPÉRATIONS DE BASE AVEC SENTINEL
-    def setex(self, key: str, ttl: timedelta, value: str) -> bool:
-        """SETEX sur le master"""
-        try:
-            self._refresh_connection_if_needed()
-            return self.master.setex(key, int(ttl.total_seconds()), value)
-        except Exception as e:
-            logger.error(f"Redis SETEX error for key {key}: {e}")
-            raise
-
-    def get(self, key: str, use_slave: bool = True) -> Optional[str]:
-        """GET - utilise le slave si disponible pour les lectures"""
-        try:
-            client = self.slave if use_slave else self.master
-            return client.get(key)
-        except Exception as e:
-            logger.error(f"Redis GET error for key {key}: {e}")
-            return None
-
-    def keys(self, pattern: str, use_slave: bool = True) -> List[str]:
-        """KEYS avec fallback sur SCAN"""
-        try:
-            client = self.slave if use_slave else self.master
-
-            # Utilise SCAN pour éviter de bloquer Redis
-            keys = []
-            cursor = 0
-            while True:
-                cursor, found_keys = client.scan(
-                    cursor=cursor,
-                    match=pattern,
-                    count=100
-                )
-                keys.extend(found_keys)
-                if cursor == 0:
-                    break
-            return keys
-
-        except Exception as e:
-            logger.error(f"Redis KEYS/SCAN error for pattern {pattern}: {e}")
-            return []
-
-    def xadd(self, stream: str, fields: Dict[str, Any], maxlen: Optional[int] = None) -> str:
-        """XADD sur le master"""
-        try:
-            self._refresh_connection_if_needed()
-
-            kwargs = {}
-            if maxlen:
-                kwargs['maxlen'] = maxlen
-                kwargs['approximate'] = True
-
-            return self.master.xadd(stream, fields, **kwargs)
-        except Exception as e:
-            logger.error(f"Redis XADD error for stream {stream}: {e}")
-            raise
-
-    def xread(self, streams: Dict[str, str], count: Optional[int] = None, block: Optional[int] = None) -> Dict:
-        """XREAD - peut utiliser le slave pour les lectures"""
-        try:
-            client = self.slave  # Lectures sur slave si possible
-
-            return client.xread(streams, count=count, block=block)
-        except Exception as e:
-            logger.error(f"Redis XREAD error for streams {streams}: {e}")
-            return {}
-
-    def xdel(self, stream: str, *message_ids: str) -> int:
-        """XDEL sur le master"""
-        try:
-            self._refresh_connection_if_needed()
-            return self.master.xdel(stream, *message_ids)
-        except Exception as e:
-            logger.error(f"Redis XDEL error for stream {stream}: {e}")
-            return 0
-
-    def xrange(self, stream: str, start: str = '-', end: str = '+', count: Optional[int] = None) -> List:
-        """XRANGE - utilise le slave pour les lectures"""
-        try:
-            client = self.slave
-            return client.xrange(stream, min=start, max=end, count=count)
-        except Exception as e:
-            logger.error(f"Redis XRANGE error for stream {stream}: {e}")
-            return []
-
-    # 🔥 FONCTIONNALITÉS AVANCÉES
-    def json_set(self, key: str, path: str, obj: Any, ttl: Optional[timedelta] = None) -> bool:
-        """JSON.SET sur le master"""
-        try:
-            self._refresh_connection_if_needed()
-
-            if hasattr(self.master, 'json_set'):
-                result = self.master.json_set(key, path, obj)
-                if result and ttl:
-                    self.master.expire(key, int(ttl.total_seconds()))
-                return result
-            else:
-                # Fallback si JSON non disponible
-                import json
-                result = self.master.set(key, json.dumps(obj))
-                if result and ttl:
-                    self.master.expire(key, int(ttl.total_seconds()))
-                return result
-        except Exception as e:
-            logger.error(f"Redis JSON.SET error for key {key}: {e}")
-            return False
-
-    def json_get(self, key: str, path: str = '.') -> Optional[Any]:
-        """JSON.GET - utilise le slave pour les lectures"""
-        try:
-            client = self.slave
-
-            if hasattr(client, 'json_get'):
-                return client.json_get(key, path)
-            else:
-                # Fallback
-                import json
-                data = client.get(key)
-                return json.loads(data) if data else None
-        except Exception as e:
-            logger.error(f"Redis JSON.GET error for key {key}: {e}")
-            return None
-
-    # 🔥 LOCKS DISTRIBUÉS OPTIMISÉS POUR SENTINEL
-    def acquire_lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10) -> Optional[str]:
-        """Acquire a distributed lock avec gestion Sentinel"""
-        identifier = str(uuid.uuid4())
-        lock_key = f"lock:{lock_name}"
-        end_time = time.time() + acquire_timeout
-
-        while time.time() < end_time:
-            try:
-                self._refresh_connection_if_needed()
-
-                if self.master.set(lock_key, identifier, ex=timeout, nx=True):
-                    return identifier
-                time.sleep(0.1)  # 100ms
-            except Exception as e:
-                logger.error(f"Redis lock acquisition error for {lock_name}: {e}")
-                break
-
-        return None
-
-    def release_lock(self, lock_name: str, identifier: str) -> bool:
-        """Release lock seulement si owned par le current process"""
-        lock_key = f"lock:{lock_name}"
-
-        lua_script = """
-            if redis.call("GET", KEYS[1]) == ARGV[1] then
-                return redis.call("DEL", KEYS[1])
-            else
-                return 0
-            end
-        """
-
-        try:
-            self._refresh_connection_if_needed()
-            release_script = self.master.register_script(lua_script)
-            result = release_script(keys=[lock_key], args=[identifier])
-            return result == 1
-        except Exception as e:
-            logger.error(f"Redis lock release error for {lock_name}: {e}")
-            return False
-
-    @contextmanager
-    def lock(self, lock_name: str, timeout: int = 30, acquire_timeout: int = 10):
-        """Context manager pour distributed locks avec Sentinel"""
-        identifier = self.acquire_lock(lock_name, timeout, acquire_timeout)
-        if not identifier:
-            raise Exception(f"Could not acquire lock: {lock_name}")
-
-        try:
-            yield identifier
-        finally:
-            self.release_lock(lock_name, identifier)
-
-    # 🔥 COORDINATION ET HA AVEC SENTINEL
-    def register_server_heartbeat(self, server_id: str, ttl: timedelta = timedelta(seconds=60)) -> bool:
-        """Enregistre un heartbeat de serveur sur le master"""
-        try:
-            self._refresh_connection_if_needed()
-
-            key = f"servers:heartbeats"
-            pipeline = self.master.pipeline()
-            pipeline.hset(key, server_id, datetime.utcnow().isoformat())
-            pipeline.expire(key, int(ttl.total_seconds() * 2))
-            pipeline.execute()
-            return True
-        except Exception as e:
-            logger.error(f"Redis heartbeat registration error for server {server_id}: {e}")
-            return False
-
-    def get_active_servers(self, max_age: timedelta = timedelta(seconds=45)) -> List[str]:
-        """Retourne les serveurs actifs - lecture sur slave"""
-        try:
-            key = f"servers:heartbeats"
-            heartbeats = self.slave.hgetall(key)
-            active_servers = []
-            current_time = datetime.utcnow()
-
-            for server_id, heartbeat_str in heartbeats.items():
-                try:
-                    heartbeat_time = datetime.fromisoformat(heartbeat_str)
-                    if (current_time - heartbeat_time) < max_age:
-                        active_servers.append(server_id)
-                except ValueError:
-                    continue
-
-            return sorted(active_servers)
-        except Exception as e:
-            logger.error(f"Redis get active servers error: {e}")
-            return []
-
-    def is_server_leader(self, server_id: str) -> bool:
-        """Détermine si le serveur est le leader"""
-        active_servers = self.get_active_servers()
-        return bool(active_servers) and active_servers[0] == server_id
-
-    # 🔥 INFORMATIONS SENTINEL
-    def get_sentinel_info(self) -> Dict[str, Any]:
-        """Récupère les informations du cluster Sentinel"""
-        try:
-            master_info = self.sentinel.discover_master(self._service_name)
-            slaves_info = self.sentinel.discover_slaves(self._service_name)
-            sentinels_info = self.sentinel.sentinels(self._service_name)
-
-            return {
-                "master": master_info,
-                "slaves": slaves_info,
-                "sentinels": sentinels_info,
-                "service_name": self._service_name,
-                "sentinel_hosts": self._sentinel_hosts
-            }
-        except Exception as e:
-            logger.error(f"Failed to get Sentinel info: {e}")
-            return {"error": str(e)}
-
-    def get_master_address(self) -> Optional[tuple]:
-        """Retourne l'adresse du master actuel"""
-        try:
-            return self.sentinel.discover_master(self._service_name)
-        except Exception as e:
-            logger.error(f"Failed to get master address: {e}")
-            return None
-
-    def failover_status(self) -> Dict[str, Any]:
-        """Statut du failover Sentinel"""
-        try:
-            master_addr = self.get_master_address()
-            active_servers = self.get_active_servers()
-
-            return {
-                "current_master": master_addr,
-                "active_servers": active_servers,
-                "total_servers": len(active_servers),
-                "is_healthy": master_addr is not None,
-                "server_id": getattr(self.config, 'SERVER_ID', 'unknown'),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        except Exception as e:
-            return {
-                "error": str(e),
-                "is_healthy": False,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-    # 🔥 HEALTH CHECK COMPLET
-    def health_check(self) -> Dict[str, Any]:
-        """Vérifie la santé complète de Redis Sentinel"""
-        try:
-            start_time = time.time()
-
-            # Test master
-            master_ping = self.master.ping()
-            master_info = self.master.info('server')
-
-            # Test slave
-            slave_ping = self.slave.ping() if self._slave_client != self._master_client else True
-
-            # Test Sentinel
-            sentinel_info = self.get_sentinel_info()
-
-            response_time = (time.time() - start_time) * 1000
-
-            return {
-                "status": "healthy",
-                "response_time_ms": round(response_time, 2),
-                "master": {
-                    "ping": master_ping,
-                    "version": master_info.get('redis_version', 'unknown'),
-                    "role": "master"
-                },
-                "slave": {
-                    "ping": slave_ping,
-                    "available": self._slave_client != self._master_client
-                },
-                "sentinel": {
-                    "service_name": self._service_name,
-                    "master_address": sentinel_info.get('master'),
-                    "slaves_count": len(sentinel_info.get('slaves', [])),
-                    "sentinels_count": len(sentinel_info.get('sentinels', []))
-                },
-                "failover_status": self.failover_status()
-            }
-
-        except Exception as e:
-            logger.error(f"Redis Sentinel health check failed: {e}")
-            return {
-                "status": "unhealthy",
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-
-    # 🔥 MÉTHODES UTILITAIRES
-    def flush_all(self) -> bool:
-        """Vide toutes les données (uniquement en dev)"""
-        if getattr(self.config, 'ENV', 'production') == 'production':
-            logger.error("🚨 FLUSH_ALL called in production! Operation blocked.")
-            return False
-
-        try:
-            self._refresh_connection_if_needed()
-            return self.master.flushall()
-        except Exception as e:
-            logger.error(f"Redis FLUSHALL error: {e}")
-            return False
-
-    def get_memory_info(self) -> Dict[str, Any]:
-        """Informations sur l'utilisation mémoire"""
-        try:
-            info = self.master.info('memory')
-            return {
-                "used_memory": info.get('used_memory', 0),
-                "used_memory_human": info.get('used_memory_human', '0B'),
-                "used_memory_peak": info.get('used_memory_peak', 0),
-                "used_memory_peak_human": info.get('used_memory_peak_human', '0B'),
-                "memory_fragmentation_ratio": info.get('mem_fragmentation_ratio', 0)
-            }
-        except Exception as e:
-            logger.error(f"Failed to get memory info: {e}")
-            return {"error": str(e)}
-```
-
-## 🛠 **Configuration pour Sentinel**
-
-```python
-# config.py
-import os
-import socket
-
-class Config:
-    # Identification serveur
-    SERVER_ID = os.getenv('SERVER_ID', socket.gethostname())
-
-    # Redis Sentinel Configuration
-    REDIS_SENTINEL_SERVICE_NAME = os.getenv('REDIS_SENTINEL_SERVICE_NAME', 'mymaster')
-    REDIS_SENTINEL_HOSTS = [
-        (os.getenv('REDIS_SENTINEL_HOST1', 'sentinel1'), int(os.getenv('REDIS_SENTINEL_PORT1', 26379))),
-        (os.getenv('REDIS_SENTINEL_HOST2', 'sentinel2'), int(os.getenv('REDIS_SENTINEL_PORT2', 26379))),
-        (os.getenv('REDIS_SENTINEL_HOST3', 'sentinel3'), int(os.getenv('REDIS_SENTINEL_PORT3', 26379))),
-    ]
-    REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
-    REDIS_SOCKET_TIMEOUT = int(os.getenv('REDIS_SOCKET_TIMEOUT', 5))
-
-    # Celery avec Sentinel
-    CELERY_BROKER_URL = f"sentinel://:{REDIS_PASSWORD}@{REDIS_SENTINEL_HOSTS[0][0]}:{REDIS_SENTINEL_HOSTS[0][1]}/0"
-    CELERY_BROKER_TRANSPORT_OPTIONS = {
-        'master_name': REDIS_SENTINEL_SERVICE_NAME,
-        'socket_timeout': REDIS_SOCKET_TIMEOUT,
-        'retry_on_timeout': True,
-        'sentinel_kwargs': {
-            'password': REDIS_PASSWORD,
-            'socket_timeout': REDIS_SOCKET_TIMEOUT
+Voici le code complet pour l'intégration d'Apigee avec Angular en utilisant angular-oauth2-oidc :
+
+## 1. Configuration AuthService
+
+```typescript
+import { Injectable } from '@angular/core';
+import { OAuthService, AuthConfig } from 'angular-oauth2-oidc';
+import { HttpClient } from '@angular/common/http';
+import { BehaviorSubject, Observable } from 'rxjs';
+import { SharedService } from './shared.service';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class AuthService {
+  private authenticated = new BehaviorSubject<boolean>(false);
+  public isAuthenticated$ = this.authenticated.asObservable();
+
+  constructor(
+    private oauthService: OAuthService,
+    private http: HttpClient,
+    private sharedService: SharedService
+  ) {
+    this.configureOAuth();
+  }
+
+  private authConfig: AuthConfig = {
+    // URL de discovery customisée pour Apigee
+    issuer: 'https://your-apigee-domain.com/oauth2',
+    loginUrl: 'https://your-apigee-domain.com/oauth2/authorize',
+    tokenEndpoint: 'https://your-apigee-domain.com/oauth2/token',
+    userinfoEndpoint: 'https://your-apigee-domain.com/oauth2/userinfo',
+    redirectUri: window.location.origin + '/callback',
+    clientId: 'your-client-id',
+    responseType: 'code',
+    scope: 'openid profile email',
+    showDebugInformation: true, // À désactiver en production
+    strictDiscoveryDocumentValidation: false,
+    sessionChecksEnabled: true,
+    timeoutFactor: 0.75,
+    clearHashAfterLogin: true
+  };
+
+  private configureOAuth(): void {
+    this.oauthService.configure(this.authConfig);
+    
+    // Configuration pour le refresh token automatique
+    this.oauthService.setupAutomaticSilentRefresh();
+    
+    // Charger la configuration de discovery
+    this.oauthService.loadDiscoveryDocument().then(() => {
+      console.log('Discovery document loaded');
+      
+      // Vérifier si l'utilisateur est déjà connecté
+      this.oauthService.tryLogin().then(() => {
+        if (this.oauthService.hasValidAccessToken()) {
+          this.authenticated.next(true);
+          this.loadUserInfo();
         }
+      });
+    }).catch(error => {
+      console.error('Error loading discovery document', error);
+    });
+
+    // Écouter les événements de token
+    this.oauthService.events.subscribe(event => {
+      if (event.type === 'token_received') {
+        this.authenticated.next(true);
+        this.loadUserInfo();
+      }
+      
+      if (event.type === 'token_refreshed') {
+        console.log('Token refreshed successfully');
+        this.loadUserInfo();
+      }
+      
+      if (event.type === 'token_expires' || event.type === 'session_terminated') {
+        this.authenticated.next(false);
+      }
+    });
+  }
+
+  public initLoginFlow(): void {
+    this.oauthService.initLoginFlow();
+  }
+
+  public login(): void {
+    this.oauthService.initLoginFlow();
+  }
+
+  public logout(): void {
+    this.oauthService.logOut();
+    this.authenticated.next(false);
+    this.sharedService.clearUserInfo();
+  }
+
+  public getToken(): string | null {
+    return this.oauthService.getAccessToken();
+  }
+
+  public decodeToken(token: string): any {
+    try {
+      const base64Url = token.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(atob(base64).split('').map(function(c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+
+      return JSON.parse(jsonPayload);
+    } catch (error) {
+      console.error('Error decoding token', error);
+      return null;
     }
-    CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+  }
+
+  private loadUserInfo(): void {
+    this.oauthService.loadUserProfile().then((userInfo: any) => {
+      console.log('User info loaded', userInfo);
+      
+      // Mettre à jour le shared service avec les informations utilisateur
+      this.sharedService.setUserInfo({
+        uid: userInfo.sub || userInfo.user_id,
+        username: userInfo.preferred_username || userInfo.username || userInfo.email,
+        email: userInfo.email,
+        avatar: userInfo.picture || userInfo.avatar,
+        given_name: userInfo.given_name,
+        family_name: userInfo.family_name,
+        name: userInfo.name,
+        // Ajouter d'autres champs selon votre configuration Apigee
+      });
+    }).catch(error => {
+      console.error('Error loading user info', error);
+      // Fallback: utiliser les informations du token
+      const token = this.getToken();
+      if (token) {
+        const decodedToken = this.decodeToken(token);
+        this.sharedService.setUserInfo({
+          uid: decodedToken.sub,
+          username: decodedToken.preferred_username || decodedToken.username,
+          email: decodedToken.email,
+          avatar: decodedToken.picture || decodedToken.avatar,
+        });
+      }
+    });
+  }
+
+  public refreshToken(): Promise<void> {
+    return this.oauthService.refreshToken().then(() => {
+      console.log('Token refreshed successfully');
+    }).catch(error => {
+      console.error('Error refreshing token', error);
+      this.logout();
+    });
+  }
+
+  public hasValidToken(): boolean {
+    return this.oauthService.hasValidAccessToken();
+  }
+
+  public getAccessToken(): string {
+    return this.oauthService.getAccessToken();
+  }
+
+  public getIdentityClaims(): any {
+    return this.oauthService.getIdentityClaims();
+  }
+}
 ```
 
-## 🐳 **Docker Compose pour Sentinel**
+## 2. Configuration AppModule
 
-```yaml
-# docker-compose.sentinel.yml
-version: '3.8'
+```typescript
+import { NgModule } from '@angular/core';
+import { BrowserModule } from '@angular/platform-browser';
+import { HttpClientModule } from '@angular/common/http';
+import { OAuthModule, OAuthStorage } from 'angular-oauth2-oidc';
 
-services:
-  # Redis Master
-  redis-master:
-    image: redis:7.2-alpine
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
-    volumes:
-      - redis_master_data:/data
-    ports:
-      - "6379:6379"
-    environment:
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
+import { AppRoutingModule } from './app-routing.module';
+import { AppComponent } from './app.component';
+import { AuthService } from './services/auth.service';
+import { SharedService } from './services/shared.service';
 
-  # Redis Slave
-  redis-slave:
-    image: redis:7.2-alpine
-    command: >
-      redis-server
-      --appendonly yes
-      --requirepass ${REDIS_PASSWORD}
-      --replicaof redis-master 6379
-      --masterauth ${REDIS_PASSWORD}
-    volumes:
-      - redis_slave_data:/data
-    depends_on:
-      - redis-master
-    environment:
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
+// Configuration du storage pour OAuth
+export function storageFactory(): OAuthStorage {
+  return localStorage;
+}
 
-  # Sentinels
-  redis-sentinel-1:
-    image: redis:7.2-alpine
-    command: >
-      redis-sentinel /etc/redis/sentinel.conf
-    volumes:
-      - ./sentinel.conf:/etc/redis/sentinel.conf
-    ports:
-      - "26379:26379"
-    depends_on:
-      - redis-master
-      - redis-slave
-
-  redis-sentinel-2:
-    image: redis:7.2-alpine
-    command: >
-      redis-sentinel /etc/redis/sentinel.conf
-    volumes:
-      - ./sentinel.conf:/etc/redis/sentinel.conf
-    ports:
-      - "26380:26379"
-    depends_on:
-      - redis-master
-      - redis-slave
-
-  redis-sentinel-3:
-    image: redis:7.2-alpine
-    command: >
-      redis-sentinel /etc/redis/sentinel.conf
-    volumes:
-      - ./sentinel.conf:/etc/redis/sentinel.conf
-    ports:
-      - "26381:26379"
-    depends_on:
-      - redis-master
-      - redis-slave
-
-  # Application
-  backend:
-    build: .
-    environment:
-      - SERVER_ID=backend-1
-      - REDIS_SENTINEL_SERVICE_NAME=mymaster
-      - REDIS_SENTINEL_HOST1=redis-sentinel-1
-      - REDIS_SENTINEL_PORT1=26379
-      - REDIS_SENTINEL_HOST2=redis-sentinel-2
-      - REDIS_SENTINEL_PORT2=26379
-      - REDIS_SENTINEL_HOST3=redis-sentinel-3
-      - REDIS_SENTINEL_PORT3=26379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
-    depends_on:
-      - redis-sentinel-1
-      - redis-sentinel-2
-      - redis-sentinel-3
-
-volumes:
-  redis_master_data:
-  redis_slave_data:
+@NgModule({
+  declarations: [
+    AppComponent
+  ],
+  imports: [
+    BrowserModule,
+    AppRoutingModule,
+    HttpClientModule,
+    OAuthModule.forRoot({
+      resourceServer: {
+        allowedUrls: ['https://your-apigee-domain.com/api'],
+        sendAccessToken: true
+      }
+    })
+  ],
+  providers: [
+    AuthService,
+    SharedService,
+    { provide: OAuthStorage, useFactory: storageFactory }
+  ],
+  bootstrap: [AppComponent]
+})
+export class AppModule { }
 ```
 
-## ✅ **AVANTAGES DE CETTE VERSION SENTINEL**
+## 3. Callback Component
 
-1. **🎯 Haute Disponibilité** : Failover automatique
-2. **📈 Performance** : Lectures sur slaves, écritures sur master
-3. **🔒 Fiabilité** : Détection automatique des pannes
-4. **🚀 Scalable** : Ajout facile de slaves
-5. **🐛 Débogable** : Monitoring complet du cluster
-6. **💪 Résilient** : Reconnexion automatique
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { ActivatedRoute, Router } from '@angular/router';
+import { OAuthService } from 'angular-oauth2-oidc';
 
-Cette version Sentinel est **parfaite pour la production** ! 🚀
+@Component({
+  selector: 'app-callback',
+  template: `
+    <div class="callback-container">
+      <div class="spinner"></div>
+      <p>Connexion en cours...</p>
+    </div>
+  `,
+  styles: [`
+    .callback-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    .spinner {
+      border: 4px solid #f3f3f3;
+      border-top: 4px solid #3498db;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 2s linear infinite;
+      margin-bottom: 16px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  `]
+})
+export class CallbackComponent implements OnInit {
+
+  constructor(
+    private oauthService: OAuthService,
+    private router: Router,
+    private route: ActivatedRoute
+  ) {}
+
+  ngOnInit(): void {
+    this.handleCallback();
+  }
+
+  private handleCallback(): void {
+    this.oauthService.loadDiscoveryDocumentAndTryLogin().then(() => {
+      if (this.oauthService.hasValidAccessToken()) {
+        // Récupérer l'URL de redirection originale ou aller vers la page d'accueil
+        const returnUrl = this.route.snapshot.queryParams['returnUrl'] || '/';
+        this.router.navigate([returnUrl]);
+      } else {
+        // Si la connexion a échoué, rediriger vers la page de login
+        this.router.navigate(['/auth']);
+      }
+    }).catch(error => {
+      console.error('Error during callback handling', error);
+      this.router.navigate(['/auth']);
+    });
+  }
+}
+```
+
+## 4. SharedService mis à jour
+
+```typescript
+import { Injectable } from '@angular/core';
+import { BehaviorSubject, Observable } from 'rxjs';
+
+export interface UserInfo {
+  uid: string;
+  username: string;
+  email?: string;
+  avatar?: string;
+  given_name?: string;
+  family_name?: string;
+  name?: string;
+  [key: string]: any;
+}
+
+@Injectable({
+  providedIn: 'root'
+})
+export class SharedService {
+  private userInfo = new BehaviorSubject<UserInfo | null>(null);
+  public userInfo$ = this.userInfo.asObservable();
+
+  constructor() {}
+
+  setUserInfo(info: UserInfo): void {
+    this.userInfo.next(info);
+    // Optionnel: stocker dans le localStorage pour persistance
+    localStorage.setItem('userInfo', JSON.stringify(info));
+  }
+
+  getUserInfo(): UserInfo | null {
+    return this.userInfo.value;
+  }
+
+  clearUserInfo(): void {
+    this.userInfo.next(null);
+    localStorage.removeItem('userInfo');
+  }
+
+  // Récupérer les infos depuis le localStorage au démarrage
+  loadStoredUserInfo(): void {
+    const stored = localStorage.getItem('userInfo');
+    if (stored) {
+      try {
+        this.userInfo.next(JSON.parse(stored));
+      } catch (error) {
+        console.error('Error parsing stored user info', error);
+        localStorage.removeItem('userInfo');
+      }
+    }
+  }
+}
+```
+
+## 5. SSO Guard mis à jour
+
+```typescript
+import { CanActivateFn, Router } from '@angular/router';
+import { inject } from '@angular/core';
+import { AuthService } from '../services/auth.service';
+import { SharedService } from '../services/shared.service';
+
+export const sSOGuard: CanActivateFn = (route, state) => {
+  const authService = inject(AuthService);
+  const sharedService = inject(SharedService);
+  const router = inject(Router);
+
+  if (authService.hasValidToken()) {
+    // Token valide présent
+    const token = authService.getToken();
+    if (token) {
+      const decodedToken = authService.decodeToken(token);
+      
+      // Si les userInfo ne sont pas encore chargés, les charger
+      if (!sharedService.getUserInfo()) {
+        authService.loadUserInfo();
+      }
+      
+      return true;
+    }
+  }
+
+  // Gestion des tokens dans les paramètres (legacy)
+  const accessToken = route.queryParams['access_token'];
+  if (accessToken) {
+    const currentPath = route.routeConfig?.path;
+    
+    if (currentPath?.startsWith('form-view')) {
+      router.navigate(['/auth'], { queryParams: { accessToken, view: 'user' } });
+    } else if (currentPath?.includes('dashboard') && currentPath?.includes('load-form')) {
+      router.navigate(['/auth'], { queryParams: { accessToken, view: 'dashboard' } });
+    } else {
+      router.navigate(['/auth'], { queryParams: { accessToken } });
+    }
+  } else {
+    // Redirection vers le login OAuth
+    authService.initLoginFlow();
+  }
+  
+  return false;
+};
+```
+
+## 6. Configuration des routes
+
+```typescript
+import { NgModule } from '@angular/core';
+import { RouterModule, Routes } from '@angular/router';
+import { CallbackComponent } from './components/callback/callback.component';
+import { sSOGuard } from './guards/sso.guard';
+
+const routes: Routes = [
+  { 
+    path: 'callback', 
+    component: CallbackComponent 
+  },
+  { 
+    path: 'protected-route', 
+    component: YourProtectedComponent,
+    canActivate: [sSOGuard] 
+  },
+  // ... autres routes
+];
+
+@NgModule({
+  imports: [RouterModule.forRoot(routes)],
+  exports: [RouterModule]
+})
+export class AppRoutingModule { }
+```
+
+## 7. Interceptor pour les appels API
+
+```typescript
+import { Injectable } from '@angular/core';
+import { HttpInterceptor, HttpRequest, HttpHandler, HttpEvent } from '@angular/common/http';
+import { Observable } from 'rxjs';
+import { AuthService } from '../services/auth.service';
+
+@Injectable()
+export class AuthInterceptor implements HttpInterceptor {
+
+  constructor(private authService: AuthService) {}
+
+  intercept(req: HttpRequest<any>, next: HttpHandler): Observable<HttpEvent<any>> {
+    // Ajouter le token aux requêtes vers Apigee
+    if (req.url.includes('your-apigee-domain.com')) {
+      const token = this.authService.getAccessToken();
+      if (token) {
+        const authReq = req.clone({
+          headers: req.headers.set('Authorization', `Bearer ${token}`)
+        });
+        return next.handle(authReq);
+      }
+    }
+    
+    return next.handle(req);
+  }
+}
+```
+
+## Points importants :
+
+1. **Discovery URL custom** : Configurez les endpoints directement dans `authConfig`
+2. **Refresh automatique** : Géré par `setupAutomaticSilentRefresh()`
+3. **UserInfo** : Récupéré depuis `/userinfo` et stocké dans `SharedService`
+4. **Callback** : Gère la redirection après authentification
+5. **Guard SSO** : Protège les routes et gère l'authentification
+
+N'oubliez pas d'adapter les URLs et clientId selon votre configuration Apigee.
+
+
+
+
+
+Oui, il existe aussi `loadDiscoveryDocumentAndTryLogin()` qui combine les deux opérations. Voici les différences et comment l'utiliser :
+
+## 1. Différence entre les méthodes
+
+```typescript
+// Méthode 1: Séparée (2 étapes)
+await oauthService.loadDiscoveryDocument(discoveryUrl);
+await oauthService.tryLogin();
+
+// Méthode 2: Combinée (1 étape)
+await oauthService.loadDiscoveryDocumentAndTryLogin(discoveryUrl);
+```
+
+## 2. Utilisation avec URL custom
+
+```typescript
+import { Injectable } from '@angular/core';
+import { OAuthService, AuthConfig } from 'angular-oauth2-oidc';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class AuthService {
+
+  constructor(private oauthService: OAuthService) {
+    this.configureOAuth();
+  }
+
+  private authConfig: AuthConfig = {
+    redirectUri: window.location.origin + '/callback',
+    clientId: 'your-client-id',
+    responseType: 'code',
+    scope: 'openid profile email',
+    showDebugInformation: true,
+    strictDiscoveryDocumentValidation: false
+  };
+
+  private async configureOAuth(): Promise<void> {
+    this.oauthService.configure(this.authConfig);
+
+    // Utilisation de loadDiscoveryDocumentAndTryLogin avec URL custom
+    const discoveryUrl = 'https://your-apigee-domain.com/oauth2/.well-known/openid-configuration';
+
+    try {
+      await this.oauthService.loadDiscoveryDocumentAndTryLogin(discoveryUrl);
+
+      console.log('Discovery loaded and login attempted');
+
+      if (this.oauthService.hasValidAccessToken()) {
+        console.log('User is authenticated');
+        await this.loadUserInfo();
+      }
+
+      // Configurer le refresh automatique après l'initialisation
+      this.setupAutomaticTokenRefresh();
+
+    } catch (error) {
+      console.error('Error during discovery and login:', error);
+    }
+  }
+}
+```
+
+## 3. Version complète avec gestion robuste
+
+```typescript
+import { Injectable } from '@angular/core';
+import { OAuthService, AuthConfig } from 'angular-oauth2-oidc';
+import { SharedService } from './shared.service';
+
+@Injectable({
+  providedIn: 'root'
+})
+export class AuthService {
+  private discoveryUrl = 'https://your-apigee-domain.com/oauth2/.well-known/openid-configuration';
+  private initialized = false;
+
+  constructor(
+    private oauthService: OAuthService,
+    private sharedService: SharedService
+  ) {
+    this.initializeAuth();
+  }
+
+  private authConfig: AuthConfig = {
+    redirectUri: window.location.origin + '/callback',
+    clientId: 'your-client-id',
+    responseType: 'code',
+    scope: 'openid profile email',
+    showDebugInformation: true,
+    strictDiscoveryDocumentValidation: false,
+    clearHashAfterLogin: true
+  };
+
+  public async initializeAuth(): Promise<boolean> {
+    if (this.initialized) {
+      return true;
+    }
+
+    this.oauthService.configure(this.authConfig);
+
+    try {
+      // Étape combinée : chargement discovery + tentative login
+      await this.oauthService.loadDiscoveryDocumentAndTryLogin(this.discoveryUrl);
+
+      this.initialized = true;
+      console.log('OAuth service initialized successfully');
+
+      // Vérifier si l'utilisateur est authentifié
+      if (this.oauthService.hasValidAccessToken()) {
+        console.log('Valid access token found');
+        await this.loadUserInfo();
+        this.setupAutomaticTokenRefresh();
+        return true;
+      } else {
+        console.log('No valid access token found');
+        return false;
+      }
+
+    } catch (error) {
+      console.error('Failed to initialize OAuth service:', error);
+      this.initialized = false;
+      return false;
+    }
+  }
+
+  private setupAutomaticTokenRefresh(): void {
+    this.oauthService.setupAutomaticSilentRefresh();
+
+    this.oauthService.events.subscribe(event => {
+      switch (event.type) {
+        case 'token_received':
+          console.log('Token received');
+          this.loadUserInfo();
+          break;
+
+        case 'token_refreshed':
+          console.log('Token refreshed automatically');
+          break;
+
+        case 'token_error':
+          console.error('Token error:', event);
+          break;
+      }
+    });
+  }
+
+  public async login(): Promise<void> {
+    // S'assurer que l'initialisation est faite
+    if (!this.initialized) {
+      await this.initializeAuth();
+    }
+
+    this.oauthService.initLoginFlow();
+  }
+
+  public async loadUserInfo(): Promise<void> {
+    try {
+      const userInfo = await this.oauthService.loadUserProfile();
+
+      this.sharedService.setUserInfo({
+        uid: userInfo.sub,
+        username: userInfo.preferred_username || userInfo.email,
+        email: userInfo.email,
+        avatar: userInfo.picture,
+        given_name: userInfo.given_name,
+        family_name: userInfo.family_name,
+        name: userInfo.name
+      });
+
+    } catch (error) {
+      console.error('Error loading user info:', error);
+      // Fallback sur les claims du token
+      const claims = this.oauthService.getIdentityClaims();
+      if (claims) {
+        this.sharedService.setUserInfo({
+          uid: claims.sub,
+          username: claims.preferred_username || claims.email,
+          email: claims.email
+        });
+      }
+    }
+  }
+
+  public getToken(): string | null {
+    return this.oauthService.getAccessToken();
+  }
+
+  public hasValidToken(): boolean {
+    return this.oauthService.hasValidAccessToken();
+  }
+}
+```
+
+## 4. Guard mis à jour pour utiliser l'initialisation
+
+```typescript
+import { CanActivateFn, Router } from '@angular/router';
+import { inject } from '@angular/core';
+import { AuthService } from '../services/auth.service';
+import { SharedService } from '../services/shared.service';
+
+export const sSOGuard: CanActivateFn = async (route, state) => {
+  const authService = inject(AuthService);
+  const sharedService = inject(SharedService);
+  const router = inject(Router);
+
+  // Attendre l'initialisation de l'auth
+  const initialized = await authService.initializeAuth();
+
+  if (!initialized) {
+    console.error('OAuth service not initialized');
+    router.navigate(['/error']);
+    return false;
+  }
+
+  if (authService.hasValidToken()) {
+    // Token valide présent
+    const token = authService.getToken();
+    if (token) {
+      // Si les userInfo ne sont pas encore chargés, les charger
+      if (!sharedService.getUserInfo()) {
+        await authService.loadUserInfo();
+      }
+      return true;
+    }
+  }
+
+  // Gestion des tokens legacy dans les paramètres
+  const accessToken = route.queryParams['access_token'];
+  if (accessToken) {
+    const currentPath = route.routeConfig?.path;
+
+    if (currentPath?.startsWith('form-view')) {
+      router.navigate(['/auth'], { queryParams: { accessToken, view: 'user' } });
+    } else if (currentPath?.includes('dashboard') && currentPath?.includes('load-form')) {
+      router.navigate(['/auth'], { queryParams: { accessToken, view: 'dashboard' } });
+    } else {
+      router.navigate(['/auth'], { queryParams: { accessToken } });
+    }
+  } else {
+    // Redirection vers le login OAuth
+    authService.login();
+  }
+
+  return false;
+};
+```
+
+## 5. Callback Component simplifié
+
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { Router, ActivatedRoute } from '@angular/router';
+import { AuthService } from '../services/auth.service';
+
+@Component({
+  selector: 'app-callback',
+  template: `
+    <div class="callback-container">
+      <div class="spinner"></div>
+      <p>Traitement de la connexion...</p>
+    </div>
+  `,
+  styles: [`
+    .callback-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    .spinner {
+      border: 4px solid #f3f3f3;
+      border-top: 4px solid #3498db;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 2s linear infinite;
+      margin-bottom: 16px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  `]
+})
+export class CallbackComponent implements OnInit {
+
+  constructor(
+    private authService: AuthService,
+    private router: Router,
+    private route: ActivatedRoute
+  ) {}
+
+  async ngOnInit(): Promise<void> {
+    // La méthode loadDiscoveryDocumentAndTryLogin est déjà appelée dans l'initialization
+    // Ici on vérifie juste le statut de l'authentification
+
+    if (this.authService.hasValidToken()) {
+      // Connexion réussie
+      const returnUrl = this.route.snapshot.queryParams['returnUrl'] || '/';
+      this.router.navigate([returnUrl]);
+    } else {
+      // Échec de la connexion
+      console.error('Authentication failed in callback');
+      this.router.navigate(['/auth'], {
+        queryParams: { error: 'authentication_failed' }
+      });
+    }
+  }
+}
+```
+
+## 6. AppComponent avec initialisation
+
+```typescript
+import { Component, OnInit } from '@angular/core';
+import { AuthService } from './services/auth.service';
+
+@Component({
+  selector: 'app-root',
+  template: `
+    <div *ngIf="!initialized" class="app-loading">
+      <p>Initialisation de l'application...</p>
+    </div>
+
+    <div *ngIf="initialized">
+      <router-outlet></router-outlet>
+    </div>
+  `
+})
+export class AppComponent implements OnInit {
+  initialized = false;
+
+  constructor(private authService: AuthService) {}
+
+  async ngOnInit(): Promise<void> {
+    // Initialiser l'authentification au démarrage de l'app
+    this.initialized = await this.authService.initializeAuth();
+
+    if (!this.initialized) {
+      console.error('Application failed to initialize');
+    }
+  }
+}
+```
+
+## Avantages de `loadDiscoveryDocumentAndTryLogin` :
+
+1. **Plus simple** : Une seule méthode à appeler
+2. **Plus robuste** : Gère la séquence correctement
+3. **Moins de code** : Réduction du code boilerplate
+4. **Meilleure gestion d'erreur** : Une seule promesse à catcher
+
+C'est la méthode recommandée pour la plupart des cas d'utilisation, surtout avec des URLs de discovery custom comme avec Apigee.
