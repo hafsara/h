@@ -1,0 +1,111 @@
+@startuml
+title High Availability Architecture – Flask + Angular + Celery + Redis Sentinel + PostgreSQL + Apigee Gateway
+
+skinparam componentStyle rectangle
+skinparam rectangle {
+  BackgroundColor<<Server>> #F2F2F2
+  BorderColor<<Server>> #888888
+  Shadowing<<Server>> true
+}
+skinparam database {
+  BackgroundColor #EFF8FF
+  BorderColor #007ACC
+}
+skinparam cloud {
+  BackgroundColor #FFF3CD
+  BorderColor #FFCC00
+}
+
+actor "Users" as users
+
+' === VIP / Load Balancer Layer ===
+cloud "VIP (Virtual IP)" as vip {
+    rectangle "Load Balancer\n(HAProxy / F5 / Keepalived)" as lb
+}
+
+' === API Gateway ===
+cloud "Apigee API Gateway\n(HTTPS 443 → 5000)" as apigee
+
+' === Application Servers ===
+rectangle "Server A\n(Red Hat)" <<Server>> {
+    [Frontend (Angular)] as feA
+    [Backend (Flask API)] as beA
+    [Celery Worker] as workerA
+    [Celery Beat (RedBeat)] as beatA
+}
+
+rectangle "Server B\n(Red Hat)" <<Server>> {
+    [Frontend (Angular)] as feB
+    [Backend (Flask API)] as beB
+    [Celery Worker] as workerB
+    [Celery Beat (RedBeat)] as beatB
+}
+
+' === Shared Infrastructure ===
+database "PostgreSQL\n(Global Shared DB)" as pg
+cloud "Redis Sentinel Cluster" as redis {
+    [Sentinel 1]
+    [Sentinel 2]
+    [Sentinel 3]
+    [Redis Master]
+    [Redis Replica]
+    [Redis Replica]
+}
+
+' === Connections ===
+users --> lb : HTTPS Requests
+lb --> feA : Route static content
+lb --> feB : Route static content
+
+feA --> apigee : HTTPS API Calls
+feB --> apigee : HTTPS API Calls
+
+apigee --> beA : Authenticated API Requests (443/5000)
+apigee --> beB : Authenticated API Requests (443/5000)
+
+beA --> pg : SQLAlchemy / psycopg2
+beB --> pg : SQLAlchemy / psycopg2
+
+beA --> redis : Celery Broker / Result Backend (via Sentinel)
+beB --> redis : Celery Broker / Result Backend (via Sentinel)
+
+workerA --> redis : Task queue access
+workerB --> redis : Task queue access
+
+beatA --> redis : RedBeat schedule lock
+beatB --> redis : RedBeat standby lock
+
+workerA --> pg : Read/Write Workflow steps
+workerB --> pg : Read/Write Workflow steps
+
+' === Notes ===
+note top of apigee
+  🔒 Apigee Gateway:
+  - Central entry point for all API calls
+  - Enforces authentication (OAuth2 / SSO)
+  - Applies rate limiting, logging, and analytics
+  - Forwards validated requests to Flask backends
+end note
+
+note top of redis
+  Redis Sentinel Cluster:
+  - 3 sentinels
+  - 1 master + 2 replica
+  - Provides HA for Celery broker/backend
+end note
+
+note right of beatA
+  RedBeat:
+  - Shared schedule stored in Redis
+  - Only one active Beat at a time
+  - Automatic failover on node failure
+end note
+
+note bottom of pg
+  PostgreSQL:
+  - Global, shared database
+  - Stores forms, workflow, and task states
+  - Access restricted to backend and Celery workers
+end note
+
+@enduml
