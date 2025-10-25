@@ -1,0 +1,136 @@
+Très bonne question 💪 — tu veux donc **remplacer proprement la clé étrangère `app_token` par `app_id`** dans PostgreSQL, **sans perdre les données existantes**.
+Voici la **procédure complète, claire et sécurisée** 👇
+
+---
+
+## ⚙️ 1️⃣ Vérifier la colonne actuelle
+
+Ouvre `psql` ou ton outil (pgAdmin, DBeaver...) et exécute :
+
+```sql
+\d email_templates;
+```
+
+Tu devrais voir quelque chose comme :
+
+```
+app_token character varying(36)
+```
+
+---
+
+## 🧩 2️⃣ Ajouter la nouvelle colonne `app_id`
+
+On ajoute d’abord la nouvelle colonne, en la remplissant avec les mêmes valeurs que l’ancienne :
+
+```sql
+ALTER TABLE email_templates
+ADD COLUMN app_id VARCHAR(36);
+```
+
+Puis on copie les valeurs existantes :
+
+```sql
+UPDATE email_templates
+SET app_id = app_token;
+```
+
+---
+
+## 🔗 3️⃣ Créer la nouvelle contrainte de clé étrangère
+
+Ajoute la contrainte FK vers la table `application` :
+
+```sql
+ALTER TABLE email_templates
+ADD CONSTRAINT fk_email_templates_app
+FOREIGN KEY (app_id)
+REFERENCES application(id)
+ON DELETE SET NULL
+ON UPDATE CASCADE;
+```
+
+✅ Ici, `ON UPDATE CASCADE` permet à PostgreSQL de **propager automatiquement** les changements d’`application.id` vers `email_templates.app_id` —
+donc **plus d’IntegrityError** si tu fais une rotation de token.
+
+---
+
+## 🧹 4️⃣ Supprimer l’ancienne colonne
+
+Une fois que tout est bon :
+
+```sql
+ALTER TABLE email_templates
+DROP COLUMN app_token;
+```
+
+---
+
+## 📜 5️⃣ Vérifier
+
+Tu peux vérifier avec :
+
+```sql
+\d email_templates;
+```
+
+Tu devrais maintenant voir :
+
+```
+app_id character varying(36)
+   References: application(id)
+   On update: CASCADE
+   On delete: SET NULL
+```
+
+---
+
+## 🚀 6️⃣ (Optionnel) — Si tu veux faire ça avec Alembic
+
+Si ton projet Flask utilise Alembic (souvent le cas), fais plutôt :
+
+```bash
+alembic revision -m "replace app_token with app_id in EmailTemplate"
+```
+
+Puis édite le fichier généré dans `migrations/versions/` et mets :
+
+```python
+def upgrade():
+    op.add_column('email_templates', sa.Column('app_id', sa.String(length=36), nullable=True))
+    op.execute('UPDATE email_templates SET app_id = app_token')
+    op.create_foreign_key(
+        'fk_email_templates_app',
+        'email_templates', 'application',
+        ['app_id'], ['id'],
+        onupdate='CASCADE',
+        ondelete='SET NULL'
+    )
+    op.drop_column('email_templates', 'app_token')
+
+def downgrade():
+    op.add_column('email_templates', sa.Column('app_token', sa.String(length=36), nullable=True))
+    op.execute('UPDATE email_templates SET app_token = app_id')
+    op.drop_constraint('fk_email_templates_app', 'email_templates', type_='foreignkey')
+    op.drop_column('email_templates', 'app_id')
+```
+
+Puis applique :
+
+```bash
+alembic upgrade head
+```
+
+---
+
+## ✅ Résultat attendu
+
+Une fois la migration faite, tu pourras :
+
+* modifier `application.id` sans `IntegrityError` (merci à `ON UPDATE CASCADE`);
+* garder toutes les références cohérentes dans `email_templates`.
+
+---
+
+Souhaites-tu que je te montre **la même migration** mais **pour toutes les tables liées à `application.id` (FormContainer, Campaign, etc.)**, avec les bonnes contraintes `ON UPDATE CASCADE` ?
+Ça te permettrait de rendre la rotation du token 100 % fiable sur toute la base.

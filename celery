@@ -1,0 +1,712 @@
+Parfait 🔥
+Tu veux donc deux choses :
+
+1. ✅ **La configuration complète et propre de `celery_app.py` pour RedBeat + Redis Sentinel**
+2. 🔍 **Un moyen simple de vérifier que RedBeat fonctionne correctement et qu’un seul Beat est actif à la fois**
+
+Je te donne tout ça clé en main 👇
+
+---
+
+## 🧱 1. Configuration complète `workflow/celery_app.py` avec **Redis Sentinel + RedBeat HA**
+
+Voici une version **stabilisée et prête pour production**, adaptée à ton code actuel :
+
+```python
+# workflow/celery_app.py
+import logging
+from datetime import timedelta, datetime
+from celery import Celery
+from celery.signals import worker_ready, worker_shutdown
+from config import Config
+from api.app import create_app
+
+logger = logging.getLogger(__name__)
+
+
+def make_celery(app):
+    celery_app = Celery(
+        __name__,
+        broker=Config.CELERY_BROKER_URL,
+        backend=Config.CELERY_RESULT_BACKEND,
+        enable_utc=True,
+    )
+
+    # ⚙️ Base Celery configuration
+    celery_app.conf.update(
+        broker_connection_retry_on_startup=True,
+        worker_proc_alive_timeout=20,
+        task_serializer='json',
+        result_serializer='json',
+        accept_content=['json'],
+        result_expires=timedelta(hours=6),
+        event_queue_ttl=60,
+        worker_send_task_events=True,
+        task_send_sent_event=True,
+        broker_transport_options={
+            'visibility_timeout': 3600,
+            'master_name': Config.REDIS_MASTER_NAME,
+            'sentinels': Config.REDIS_SENTINELS,
+            'socket_timeout': 0.5,
+        },
+        worker_prefetch_multiplier=1,
+        task_acks_late=True,
+        broker_heartbeat=30,
+        broker_pool_limit=None,
+    )
+
+    # ⚙️ RedBeat configuration (Beat HA)
+    celery_app.conf.beat_scheduler = 'redbeat.RedBeatScheduler'
+    celery_app.conf.redbeat_redis_url = Config.CELERY_BROKER_URL
+    celery_app.conf.redbeat_lock_key = "redbeat::lock"
+    celery_app.conf.redbeat_lock_timeout = 30.0  # secondes
+    celery_app.conf.redbeat_key_prefix = "redbeat"  # pour séparer les environnements
+
+    # ⚙️ Task queues
+    celery_app.conf.task_queues = {
+        'beat_tasks': {
+            'exchange': 'beat',
+            'routing_key': 'beat.process',
+            'queue_arguments': {'x-max-priority': 10}
+        },
+        'default': {
+            'exchange': 'default',
+            'routing_key': 'default.process'
+        }
+    }
+
+    # ⚙️ Beat schedule (shared between all nodes via RedBeat)
+    celery_app.conf.beat_schedule = {
+        'process-scheduled-steps': {
+            'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
+            'schedule': timedelta(seconds=300),
+            'options': {
+                'queue': 'beat_tasks',
+                'priority': 5,
+                'expires': 300
+            }
+        },
+        # tu peux en ajouter d'autres ici
+    }
+
+    # Flask context for Celery tasks
+    class FlaskContextTask(celery_app.Task):
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return super().__call__(*args, **kwargs)
+
+        def on_failure(self, exc, task_id, args, kwargs, einfo):
+            logger.error(f"Task {task_id} failed: {exc}")
+            super().on_failure(exc, task_id, args, kwargs, einfo)
+
+    celery_app.Task = FlaskContextTask
+
+    # Celery worker lifecycle hooks
+    @worker_ready.connect
+    def worker_ready_handler(sender, **kwargs):
+        logger.info(f"Worker {sender.hostname} ready")
+
+    @worker_shutdown.connect
+    def worker_shutdown_handler(sender, **kwargs):
+        logger.info(f"Worker {sender.hostname} shutting down")
+
+    return celery_app
+
+
+# Flask + Celery bootstrap
+app = create_app(Config)
+celery_app = make_celery(app)
+
+
+# Simple health check task
+@celery_app.task(bind=True)
+def health_check(self):
+    return {
+        "status": "OK",
+        "worker": self.request.hostname,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+```
+
+---
+
+## ⚙️ 2. Dans `config.py` → Exemple complet pour Redis Sentinel + RedBeat
+
+```python
+# config.py
+class Config:
+    # Redis Sentinel setup
+    REDIS_SENTINELS = [
+        ("redis-sentinel1", 26379),
+        ("redis-sentinel2", 26379),
+        ("redis-sentinel3", 26379),
+    ]
+    REDIS_MASTER_NAME = "mymaster"
+
+    CELERY_BROKER_URL = (
+        f"sentinel://{','.join([f'{h}:{p}' for h, p in REDIS_SENTINELS])}/0"
+    )
+    CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+```
+
+---
+
+## 🚀 3. Commandes à exécuter sur tes serveurs
+
+### Sur **serverA**
+
+```bash
+celery -A workflow.celery_app.celery_app worker -l info -Q default,beat_tasks -n workerA@%h
+celery -A workflow.celery_app.celery_app beat -l info --scheduler redbeat.RedBeatScheduler
+```
+
+### Sur **serverB**
+
+```bash
+celery -A workflow.celery_app.celery_app worker -l info -Q default,beat_tasks -n workerB@%h
+celery -A workflow.celery_app.celery_app beat -l info --scheduler redbeat.RedBeatScheduler
+```
+
+✅ RedBeat va stocker le plan des tâches dans Redis, et gérer le verrouillage automatiquement.
+Seul **un Beat actif** exécutera le schedule ; l’autre restera standby.
+
+---
+
+## 🔍 4. Vérifier que **RedBeat** fonctionne et qu’un seul Beat est actif
+
+### a. Vérifie la présence des clés RedBeat dans Redis
+
+Connecte-toi à un des Redis Sentinels :
+
+```bash
+redis-cli -p 6379
+keys *redbeat*
+```
+
+Tu devrais voir des clés comme :
+
+```
+redbeat::lock
+redbeat::schedule
+redbeat::schedule:process-scheduled-steps
+```
+
+👉 `redbeat::lock` doit être détenu par **un seul Beat à la fois**.
+Si tu vois deux clés de lock, c’est qu’il y a un souci (Beat concurrent).
+
+---
+
+### b. Vérifie les logs Celery Beat
+
+Sur **serverA et serverB**, tu verras dans les logs :
+
+```
+[INFO/MainProcess] beat: Starting...
+[INFO/MainProcess] redbeat: Acquiring lock...
+[INFO/MainProcess] redbeat: This node is the active scheduler.
+```
+
+Et sur le standby :
+
+```
+[INFO/MainProcess] redbeat: Waiting for lock...
+[INFO/MainProcess] redbeat: Lost lock, will retry.
+```
+
+✅ → Tant qu’un Beat détient le lock `redbeat::lock`, l’autre reste inactif.
+
+---
+
+### c. Teste le failover RedBeat
+
+1. Arrête le Beat actif (sur `serverA`) :
+
+   ```bash
+   systemctl stop celery@beat
+   ```
+2. En ~30 secondes, regarde les logs sur `serverB` :
+
+   ```
+   redbeat: Acquired lock
+   redbeat: This node is now the active scheduler.
+   ```
+
+✅ → Le Beat secondaire prend la main automatiquement.
+
+---
+
+## 🧠 En résumé
+
+| Élément                    | Configuré via              |
+| -------------------------- | -------------------------- |
+| Broker & Backend HA        | Redis Sentinel             |
+| Beat HA                    | RedBeat                    |
+| Worker distribution        | Celery natif               |
+| Détection Beat actif       | `redbeat::lock` dans Redis |
+| Redondance complète        | ✅ oui                      |
+| Lock manuel supplémentaire | ❌ inutile dans ce setup    |
+
+---
+
+Souhaites-tu que je te donne aussi la **version systemd** prête à copier-coller (`/etc/systemd/system/celery@worker.service` et `/etc/systemd/system/celery@beat.service`) avec restart automatique et logs séparés ?
+
+
+
+# scripts/beat_monitor.py
+import time
+import logging
+from redis.sentinel import Sentinel
+from config import Config
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def monitor_beats():
+    """Monitorer l'état des beats"""
+    try:
+        sentinel = Sentinel(Config.REDIS_SENTINEL_HOSTS)
+        redis_client = sentinel.master_for(Config.REDIS_SENTINEL_MASTER_NAME)
+
+        # Trouver le leader actuel
+        leader = redis_client.get('celery:beat:leader')
+        leader_id = leader.decode() if leader else "Aucun"
+
+        # Trouver tous les heartbeats actifs
+        pattern = 'celery:beat:heartbeat:*'
+        active_beats = []
+
+        for key in redis_client.scan_iter(pattern):
+            beat_id = key.decode().split(':')[-1]
+            heartbeat = redis_client.get(key)
+            if heartbeat:
+                active_beats.append(beat_id)
+
+        logger.info(f"Leader actuel: {leader_id}")
+        logger.info(f"Beats actifs: {active_beats}")
+        logger.info(f"Nombre de beats: {len(active_beats)}")
+
+        return {
+            'leader': leader_id,
+            'active_beats': active_beats,
+            'total_beats': len(active_beats)
+        }
+
+    except Exception as e:
+        logger.error(f"Erreur monitoring: {e}")
+        return {}
+
+if __name__ == "__main__":
+    while True:
+        monitor_beats()
+        time.sleep(30)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Vous avez raison ! Un lock global est beaucoup plus simple et efficace. Voici la solution avec un lock Redis global et la configuration redBeat :
+
+## 1. Configuration redBeat dans Celery
+
+```python
+# workflow/celery_app.py
+from datetime import timedelta, datetime
+from celery import Celery
+from celery.signals import beat_init, worker_ready
+from config import Config
+from api.app import create_app
+import logging
+
+logger = logging.getLogger(__name__)
+
+def make_celery(app):
+    # Configuration Redis avec Sentinel
+    broker_url = f"sentinel://:{Config.REDIS_PASSWORD}@{Config.REDIS_SENTINEL_MASTER_NAME}"
+    backend_url = f"sentinel://:{Config.REDIS_PASSWORD}@{Config.REDIS_SENTINEL_MASTER_NAME}"
+
+    celery_app = Celery(
+        __name__,
+        broker=broker_url,
+        backend=backend_url,
+        enable_utc=True,
+    )
+
+    # Configuration redBeat pour la coordination des beats multiples
+    celery_app.conf.update(
+        # Configuration redBeat
+        beat_scheduler="redbeat.RedBeatScheduler",
+        redbeat_redis_url=broker_url,
+        redbeat_key_prefix="redbeat:",
+        redbeat_lock_key="redbeat::lock",
+        redbeat_lock_timeout=60,  # 60 secondes de lock
+
+        # Configuration transport Redis
+        broker_transport_options={
+            'master_name': Config.REDIS_SENTINEL_MASTER_NAME,
+            'sentinel_kwargs': {
+                'password': Config.REDIS_PASSWORD,
+                'socket_timeout': Config.REDIS_SOCKET_TIMEOUT
+            }
+        },
+        result_backend_transport_options={
+            'master_name': Config.REDIS_SENTINEL_MASTER_NAME,
+            'sentinel_kwargs': {
+                'password': Config.REDIS_PASSWORD,
+                'socket_timeout': Config.REDIS_SOCKET_TIMEOUT
+            }
+        },
+
+        # Configuration Celery standard
+        broker_connection_retry_on_startup=True,
+        task_serializer='json',
+        result_serializer='json',
+        accept_content=['json'],
+        result_expires=timedelta(hours=6),
+        timezone='UTC',
+
+        # Beat configuration
+        beat_max_loop_interval=10,
+        beat_sync_every=1,
+    )
+
+    # Files d'attente
+    celery_app.conf.task_queues = {
+        'beat_tasks': {
+            'exchange': 'beat',
+            'routing_key': 'beat.process',
+            'queue_arguments': {'x-max-priority': 10}
+        },
+        'high_priority': {
+            'exchange': 'high',
+            'routing_key': 'high.process',
+            'queue_arguments': {'x-max-priority': 5}
+        },
+        'default': {
+            'exchange': 'default',
+            'routing_key': 'default.process'
+        }
+    }
+
+    # Configuration des tâches périodiques avec redBeat
+    celery_app.conf.beat_schedule = {
+        'process-scheduled-steps': {
+            'task': 'workflow.tasks.core.scheduler.process_scheduled_steps',
+            'schedule': timedelta(seconds=30),
+            'options': {
+                'queue': 'beat_tasks',
+                'priority': 5,
+                'expires': 45
+            },
+            'args': [],
+            'kwargs': {}
+        },
+        'cleanup-old-tasks': {
+            'task': 'workflow.tasks.core.scheduler.cleanup_old_tasks',
+            'schedule': timedelta(hours=1),
+            'options': {
+                'queue': 'beat_tasks',
+                'priority': 1
+            }
+        }
+    }
+
+    class FlaskContextTask(celery_app.Task):
+        def __call__(self, *args, **kwargs):
+            with app.app_context():
+                return super().__call__(*args, **kwargs)
+
+    celery_app.Task = FlaskContextTask
+
+    @beat_init.connect
+    def beat_init_handler(sender, **kwargs):
+        logger.info(f"RedBeat scheduler initialized on {Config.SERVER_NAME}")
+
+    @worker_ready.connect
+    def worker_ready_handler(sender, **kwargs):
+        logger.info(f"Worker {sender.hostname} ready")
+
+    return celery_app
+
+app = create_app(Config)
+celery_app = make_celery(app)
+```
+
+## 2. Lock global simple pour process_scheduled_steps
+
+```python
+# workflow/tasks/core/scheduler.py
+import logging
+import random
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+from redis.sentinel import Sentinel
+from sqlalchemy.exc import SQLAlchemyError
+
+from api.models import FormContainer, WorkflowStep
+from api.extensions import db
+from workflow.celery_app import celery_app as app
+from config import Config
+
+from workflow.tasks.operations.escalate import send_escalate_task
+from workflow.tasks.operations.reminder import send_reminder_task
+
+logger = logging.getLogger(__name__)
+
+@contextmanager
+def distributed_lock(lock_key: str, timeout: int = 300):
+    """Context manager pour un lock distribué simple"""
+    redis_client = None
+    lock_acquired = False
+    lock_value = f"lock_{random.randint(1000, 9999)}_{datetime.utcnow().timestamp()}"
+
+    try:
+        sentinel = Sentinel(
+            Config.REDIS_SENTINEL_HOSTS,
+            socket_timeout=Config.REDIS_SOCKET_TIMEOUT,
+            password=Config.REDIS_PASSWORD
+        )
+        redis_client = sentinel.master_for(
+            Config.REDIS_SENTINEL_MASTER_NAME,
+            socket_timeout=Config.REDIS_SOCKET_TIMEOUT,
+            password=Config.REDIS_PASSWORD
+        )
+
+        # Acquérir le lock
+        lock_acquired = redis_client.set(
+            lock_key,
+            lock_value,
+            ex=timeout,
+            nx=True  # Set only if not exists
+        )
+
+        if lock_acquired:
+            logger.info(f"Lock acquis: {lock_key}")
+            yield True
+        else:
+            logger.debug(f"Lock non acquis: {lock_key}")
+            yield False
+
+    except Exception as e:
+        logger.error(f"Erreur lock Redis: {e}")
+        # En cas d'erreur Redis, on exécute quand même pour la résilience
+        yield True
+    finally:
+        # Libérer le lock seulement si on l'a acquis
+        if lock_acquired and redis_client:
+            try:
+                # Vérifier que c'est bien notre lock avant de le supprimer
+                current_value = redis_client.get(lock_key)
+                if current_value and current_value.decode() == lock_value:
+                    redis_client.delete(lock_key)
+                    logger.info(f"Lock libéré: {lock_key}")
+            except Exception as e:
+                logger.error(f"Erreur libération lock: {e}")
+
+@app.task(bind=True)
+def process_scheduled_steps(self) -> None:
+    """Tâche périodique avec lock global"""
+
+    # Lock global pour éviter les exécutions simultanées
+    lock_key = "celery:beat:process_scheduled_steps:global_lock"
+
+    with distributed_lock(lock_key, timeout=120) as lock_acquired:
+        if not lock_acquired:
+            logger.info("Traitement déjà en cours par un autre beat, skip")
+            return
+
+        logger.info("Début du traitement des steps planifiés")
+
+        try:
+            processed_count = 0
+            with db.session.begin():
+                # Fenêtre de traitement large pour éviter les trous
+                window_start = datetime.utcnow() - timedelta(minutes=5)
+                window_end = datetime.utcnow() + timedelta(minutes=1)
+
+                steps = WorkflowStep.query.filter(
+                    WorkflowStep.status == 'pending',
+                    WorkflowStep.scheduled_time.between(window_start, window_end)
+                ).with_for_update(skip_locked=True).limit(100)
+
+                step_map = {
+                    'reminder': send_reminder_task,
+                    'escalation': send_escalate_task,
+                    'reminder-escalation': send_escalate_task
+                }
+
+                for step in steps:
+                    # Vérification de cohérence
+                    if not FormContainer.query.get(step.container_id):
+                        step.status = 'revoked'
+                        logger.warning(f"Step {step.id} revoqué - container introuvable")
+                        continue
+
+                    # Traitement du step
+                    step.status = 'processing'
+                    task = step_map.get(step.step_type)
+                    if task:
+                        # Pour les reminders, passer le compteur
+                        if step.step_type == 'reminder':
+                            task.apply_async(
+                                args=[step.id, step.form_id, step.container_id, step.step_index],
+                                queue='high_priority'
+                            )
+                        else:
+                            task.apply_async(
+                                args=[step.id, step.form_id, step.container_id],
+                                queue='high_priority'
+                            )
+                        processed_count += 1
+                        logger.debug(f"Step {step.id} ({step.step_type}) planifié")
+                    else:
+                        logger.error(f"Type de step inconnu: {step.step_type}")
+                        step.status = 'failed'
+
+                db.session.commit()
+                logger.info(f"Traitement terminé: {processed_count} steps planifiés")
+
+        except SQLAlchemyError as e:
+            logger.error(f"Erreur base de données: {str(e)}")
+            db.session.rollback()
+            self.retry(countdown=300, max_retries=3)
+        except Exception as e:
+            logger.error(f"Erreur inattendue: {str(e)}")
+            self.retry(countdown=600, max_retries=2)
+
+@app.task(bind=True)
+def cleanup_old_tasks(self) -> None:
+    """Nettoyage des tâches anciennes"""
+    with distributed_lock("celery:beat:cleanup_lock", timeout=300) as lock_acquired:
+        if not lock_acquired:
+            return
+
+        try:
+            # Supprimer les steps terminés depuis plus de 7 jours
+            cutoff_date = datetime.utcnow() - timedelta(days=7)
+
+            with db.session.begin():
+                deleted_count = WorkflowStep.query.filter(
+                    WorkflowStep.status.in_(['completed', 'failed', 'revoked']),
+                    WorkflowStep.updated_at < cutoff_date
+                ).delete()
+
+                db.session.commit()
+                logger.info(f"Cleanup: {deleted_count} anciens steps supprimés")
+
+        except Exception as e:
+            logger.error(f"Erreur cleanup: {e}")
+            db.session.rollback()
+```
+
+## 3. Configuration des serveurs
+
+### Serveur 1
+```bash
+# Configuration
+export SERVER_NAME="beat-worker-01"
+export CELERY_QUEUES="beat_tasks,high_priority,default"
+
+# Lancer redBeat + worker
+celery -A workflow.celery_app.celery_app beat --scheduler redbeat.RedBeatScheduler --loglevel=info &
+celery -A workflow.celery_app.celery_app worker --queues=$CELERY_QUEUES --concurrency=4 --hostname=worker_$SERVER_NAME --loglevel=info
+```
+
+### Serveur 2
+```bash
+# Configuration
+export SERVER_NAME="beat-worker-02"
+export CELERY_QUEUES="beat_tasks,high_priority,default"
+
+# Lancer redBeat + worker (identique)
+celery -A workflow.celery_app.celery_app beat --scheduler redbeat.RedBeatScheduler --loglevel=info &
+celery -A workflow.celery_app.celery_app worker --queues=$CELERY_QUEUES --concurrency=4 --hostname=worker_$SERVER_NAME --loglevel=info
+```
+
+## 4. Fichier requirements.txt
+
+```txt
+# Ajouter redBeat
+redbeat==2.1.0
+celery==5.3.4
+redis==4.5.5
+flower==1.2.0
+```
+
+## 5. Script de monitoring simple
+
+```python
+# scripts/monitor_redbeat.py
+import time
+import logging
+from redis.sentinel import Sentinel
+from config import Config
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def monitor_redbeat():
+    """Monitorer l'état de redBeat"""
+    try:
+        sentinel = Sentinel(Config.REDIS_SENTINEL_HOSTS)
+        redis_client = sentinel.master_for(Config.REDIS_SENTINEL_MASTER_NAME)
+
+        # Vérifier les clés redBeat
+        redbeat_keys = redis_client.keys("redbeat:*")
+        schedules = redis_client.keys("redbeat:*.*")  # Les tâches planifiées
+
+        # Vérifier le lock global
+        lock_key = "celery:beat:process_scheduled_steps:global_lock"
+        lock_info = redis_client.get(lock_key)
+        lock_ttl = redis_client.ttl(lock_key)
+
+        logger.info(f"RedBeat keys: {len(redbeat_keys)}")
+        logger.info(f"Scheduled tasks: {len(schedules)}")
+        logger.info(f"Global lock: {lock_info} (TTL: {lock_ttl}s)")
+
+        # Afficher les tâches planifiées
+        for schedule_key in schedules[:5]:  # Premières 5
+            task_data = redis_client.hgetall(schedule_key)
+            logger.info(f"Task {schedule_key}: {task_data}")
+
+    except Exception as e:
+        logger.error(f"Erreur monitoring: {e}")
+
+if __name__ == "__main__":
+    while True:
+        monitor_redbeat()
+        time.sleep(30)
+```
+
+## 6. Avantages de cette solution
+
+1. **Simplicité** : Un seul lock global facile à comprendre
+2. **redBeat intégré** : Gère naturellement les beats multiples
+3. **Résilience** : Si un beat crash, le lock expire automatiquement
+4. **Performance** : Pas de heartbeat continu, juste un lock ponctuel
+5. **Monitoring facile** : Un seul point à vérifier
+
+## 7. Commandes de test
+
+```bash
+# Vérifier que les deux beats tournent
+ps aux | grep "celery beat"
+
+# Vérifier les locks Redis
+redis-cli -h <redis-host> keys "redbeat:*"
+redis-cli -h <redis-host> get "celery:beat:process_scheduled_steps:global_lock"
+
+# Monitoring en temps réel
+tail -f /var/log/celery/beat.log
+```
+
+Cette solution avec un lock global simple + redBeat est effectivement beaucoup plus propre et maintenable que l'approche complexe avec leader election !
