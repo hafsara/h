@@ -1,56 +1,63 @@
 // =========================================
-// APPLICATION CONTEXT SERVICE
+// 1️⃣ APPLICATION CONTEXT SERVICE (LOGOUT UPDATED)
+// =========================================
+
+logout(): Observable<any> {
+  return this.http.post(`${this.apiBaseUrl}/logout`, {}, {
+    withCredentials: true,
+  }).pipe(
+    tap(() => {
+      this.contextSubject.next(null);
+      this.refreshTimerStarted = false;
+
+      // 📢 Notifier les autres fenêtres du logout
+      try {
+        this.channel.postMessage({
+          type: 'context-logout',
+        });
+      } catch (e) {
+        console.warn('Failed to broadcast logout:', e);
+      }
+    })
+  );
+}
+
+// =========================================
+// 2️⃣ MENU SERVICE (LOGOUT PARTAGÉ)
 // =========================================
 
 import { Injectable } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-import { BehaviorSubject, Observable, interval } from 'rxjs';
-import { tap, catchError, switchMap } from 'rxjs/operators';
-import { environment } from '../../environments/environment';
+import { Router } from '@angular/router';
+import { TokenService } from '../token.service';
+import { ApplicationContextService } from './application-context.service';
 
-export interface AppContext {
-  session_id: string;
-  user_type: 'USER' | 'API_CLIENT' | 'ADMIN';
-  accessibleApps: Array<{
-    name: string;
-    id?: string;
-  }>;
-  sessionExpiresAt: string;
-  lastActivity: string;
+export interface MenuConfig {
+  isDarkMode: boolean;
+  toggleDarkMode: () => void;
+  navigateToAdmin: () => void;
 }
 
 @Injectable({ providedIn: 'root' })
-export class ApplicationContextService {
-  private contextSubject = new BehaviorSubject<AppContext | null>(null);
-  public context$ = this.contextSubject.asObservable();
-
-  private loadingSubject = new BehaviorSubject<boolean>(false);
-  public loading$ = this.loadingSubject.asObservable();
-
-  private apiBaseUrl = `${environment.apiUrl}/sessions`;
-  private refreshTimerStarted = false;
+export class MenuService {
   private channel: BroadcastChannel;
-  private isInitializing = false;
 
-  constructor(private http: HttpClient) {
-    this.setupBroadcastChannel();
-    // NE PAS charger ici, attendre le guard
+  constructor(
+    private tokenService: TokenService,
+    private appContext: ApplicationContextService,
+    private router: Router
+  ) {
+    this.setupLogoutBroadcasting();
   }
 
-  // 🔑 Setup BroadcastChannel pour synchroniser entre fenêtres
-  private setupBroadcastChannel(): void {
+  // 🔑 Setup BroadcastChannel pour écouter les logouts d'autres fenêtres
+  private setupLogoutBroadcasting(): void {
     try {
-      this.channel = new BroadcastChannel('app-context');
+      this.channel = new BroadcastChannel('auth-logout');
       this.channel.onmessage = (event) => {
-        if (event.data.type === 'context-updated') {
-          // Une autre fenêtre a mis à jour le contexte
-          this.contextSubject.next(event.data.context);
-          console.log('Context synced from another window:', event.data.context);
-        } else if (event.data.type === 'context-logout') {
-          // Une autre fenêtre s'est logout
-          this.contextSubject.next(null);
-          this.refreshTimerStarted = false;
-          console.log('Context cleared from logout in another window');
+        if (event.data.type === 'logout-triggered') {
+          console.log('Logout detected from another window');
+          // Une autre fenêtre a fait un logout
+          this.handleLogout();
         }
       };
     } catch (e) {
@@ -58,176 +65,59 @@ export class ApplicationContextService {
     }
   }
 
-  // 📡 Fonction PUBLIQUE : initialiser le contexte (à appeler du guard)
-  initializeContext(): Observable<AppContext> {
-    // ✅ Si déjà en cours d'initialisation, ne pas refaire
-    if (this.isInitializing) {
-      console.warn('Context initialization already in progress');
-      return this.context$;
-    }
-
-    // ✅ Si contexte déjà présent, retourner directement
-    if (this.contextSubject.value !== null) {
-      console.log('Context already loaded');
-      return this.context$;
-    }
-
-    this.isInitializing = true;
-    this.loadingSubject.next(true);
-
-    return this.loadContext().pipe(
-      tap(context => {
-        this.contextSubject.next(context);
-        this.loadingSubject.next(false);
-        this.isInitializing = false;
-
-        // 📢 Notifier les autres fenêtres
-        this.broadcastContextUpdate(context);
-
-        // Démarrer le refresh timer APRÈS le premier chargement
-        this.startRefreshTimer();
-      }),
-      catchError(err => {
-        console.error('Failed to load context:', err);
-        this.loadingSubject.next(false);
-        this.isInitializing = false;
-        throw err;
-      })
-    );
+  getMainMenu(config: MenuConfig): any[] {
+    return [
+      {
+        label: 'Settings',
+        icon: 'pi pi-cog',
+        command: () => config.navigateToAdmin()
+      },
+      {
+        label: config.isDarkMode ? 'Light Mode' : 'Dark Mode',
+        icon: config.isDarkMode ? 'pi pi-sun' : 'pi pi-moon',
+        command: () => config.toggleDarkMode()
+      },
+      {
+        label: 'Logout',
+        icon: 'pi pi-power-off',
+        command: () => this.logout()
+      }
+    ];
   }
 
-  // 🔄 Charger le contexte depuis l'API
-  private loadContext(): Observable<AppContext> {
-    return this.http.get<AppContext>(`${this.apiBaseUrl}`, {
-      withCredentials: true,
-    }).pipe(
-      tap(context => {
-        console.log('Context loaded from API:', context);
-      }),
-      catchError(error => {
-        console.error('Failed to load context from API:', error);
-        throw error;
-      })
-    );
+  // 🔑 Logout - appelle l'API et notifie les autres fenêtres
+  logout(): void {
+    this.appContext.logout().subscribe({
+      next: () => {
+        console.log('Logout successful');
+        this.broadcastLogout();
+        this.handleLogout();
+      },
+      error: (err) => {
+        console.error('Logout failed:', err);
+        // Même en erreur, faire le logout local
+        this.broadcastLogout();
+        this.handleLogout();
+      }
+    });
   }
 
-  // 📢 Envoyer le contexte aux autres fenêtres via BroadcastChannel
-  private broadcastContextUpdate(context: AppContext): void {
+  // 📢 Envoyer un message logout aux autres fenêtres
+  private broadcastLogout(): void {
     try {
       this.channel.postMessage({
-        type: 'context-updated',
-        context: context,
+        type: 'logout-triggered',
       });
+      console.log('Logout broadcasted to other windows');
     } catch (e) {
-      console.warn('Failed to broadcast context update:', e);
+      console.warn('Failed to broadcast logout:', e);
     }
   }
 
-  // 🔄 Démarrer le timer de refresh (toutes les 30 min)
-  private startRefreshTimer(): void {
-    if (this.refreshTimerStarted) return;
-
-    this.refreshTimerStarted = true;
-    interval(30 * 60 * 1000)
-      .pipe(
-        switchMap(() => this.refreshSession()),
-        catchError(err => {
-          console.error('Session refresh failed:', err);
-          return [];
-        })
-      )
-      .subscribe();
-  }
-
-  // ================== ACCÈS AU CONTEXTE ==================
-
-  get currentContext(): AppContext | null {
-    return this.contextSubject.value;
-  }
-
-  get allAccessibleApps(): Array<{ name: string; id?: string }> {
-    return this.contextSubject.value?.accessibleApps ?? [];
-  }
-
-  get accessibleApps(): Array<{ name: string; id?: string }> {
-    const apps = this.contextSubject.value?.accessibleApps ?? [];
-    return apps.filter(app => app.name.toLowerCase() !== 'admin');
-  }
-
-  get hasAdminAccess(): boolean {
-    const apps = this.allAccessibleApps;
-    return apps.some(app => app.name.toLowerCase() === 'admin');
-  }
-
-  canAccessApp(appName: string): boolean {
-    return this.allAccessibleApps.some(
-      app => app.name.toLowerCase() === appName.toLowerCase()
-    );
-  }
-
-  // ================== SESSION MANAGEMENT ==================
-
-  refreshSession(): Observable<AppContext> {
-    return this.http.post<AppContext>(`${this.apiBaseUrl}/refresh`, {}, {
-      withCredentials: true,
-    }).pipe(
-      tap(context => {
-        this.contextSubject.next(context);
-        this.broadcastContextUpdate(context);
-      }),
-      catchError(error => {
-        console.error('Session refresh failed:', error);
-        throw error;
-      })
-    );
-  }
-
-  logout(): Observable<any> {
-    return this.http.post(`${this.apiBaseUrl}/logout`, {}, {
-      withCredentials: true,
-    }).pipe(
-      tap(() => {
-        this.contextSubject.next(null);
-        this.refreshTimerStarted = false;
-
-        // 📢 Notifier les autres fenêtres du logout
-        try {
-          this.channel.postMessage({
-            type: 'context-logout',
-          });
-        } catch (e) {
-          console.warn('Failed to broadcast logout:', e);
-        }
-      })
-    );
-  }
-
-  login(appTokens: string[]): Observable<AppContext> {
-    return this.http.post<AppContext>(`${this.apiBaseUrl}/login`, { appTokens }, {
-      withCredentials: true,
-    }).pipe(
-      tap(context => {
-        this.contextSubject.next(context);
-        this.broadcastContextUpdate(context);
-        this.startRefreshTimer();
-      }),
-      catchError(error => {
-        console.error('Failed to login:', error);
-        throw error;
-      })
-    );
-  }
-
-  // ================== VÉRIFICATIONS ==================
-
-  isSessionExpired(): boolean {
-    const context = this.contextSubject.value;
-    if (!context) return true;
-    return new Date(context.sessionExpiresAt) < new Date();
-  }
-
-  isContextReady(): boolean {
-    return this.contextSubject.value !== null;
+  // 🧹 Nettoyer les données locales et rediriger
+  private handleLogout(): void {
+    this.tokenService.logout();
+    this.router.navigate(['/access-control']);
   }
 
   ngOnDestroy(): void {
@@ -238,121 +128,283 @@ export class ApplicationContextService {
 }
 
 // =========================================
-// AUTH GUARD (UTILISE initializeContext())
+// 3️⃣ NAVBAR COMPONENT (LOGOUT UPDATED)
 // =========================================
 
-import { Injectable } from '@angular/core';
-import {
-  CanActivate,
-  ActivatedRouteSnapshot,
-  Router,
-  UrlTree,
-} from '@angular/router';
-import { Observable } from 'rxjs';
-import { tap, catchError, switchMap } from 'rxjs/operators';
-import { ApplicationContextService } from '../services/application-context.service';
+import { Component, Output, EventEmitter, OnInit, OnDestroy, Input } from '@angular/core';
+import { fromEvent, Subscription } from 'rxjs';
+import { debounceTime } from 'rxjs/operators';
+import { TokenService } from '../../services/token.service';
+import { SharedService } from '../../services/shared.service';
+import { Router } from '@angular/router';
+import { ApplicationMonitorService } from '../../services/navbar/application-monitor.service';
+import { MessageService } from 'primeng/api';
+import { AppSelectionService } from '../../services/navbar/app-selection.service';
+import { MenuService, MenuConfig } from '../../services/navbar/menu.service';
+import { SidebarStateService } from '../../services/navbar/sidebar-state.service';
+import { DarkModeService } from '../../services/navbar/dark-mode.service';
+import { ApplicationContextService } from '../../services/application-context.service';
+import { Subject, takeUntil } from 'rxjs';
 
-@Injectable({ providedIn: 'root' })
-export class AuthGuard implements CanActivate {
+@Component({
+  selector: 'app-navbar',
+  templateUrl: './navbar.component.html',
+  styleUrls: ['./navbar.component.scss']
+})
+export class NavbarComponent implements OnInit, OnDestroy {
+  @Output() appOptionsLoaded = new EventEmitter<{ name: string; token: string }[]>();
+  @Output() selectedAppIdsChange = new EventEmitter<string[]>();
+  @Output() menuItemSelected = new EventEmitter<string>();
+  @Output() createForm = new EventEmitter<void>();
+  @Output() adminTabSelected = new EventEmitter<string>();
+  @Input() isAdminMode = false;
+
+  isMobile = false;
+  isSidebarCollapsed = true;
+  isMobileOpen = false;
+  showSidebar = true;
+  private resizeSubscription: Subscription | null = null;
+  isDarkMode = false;
+  userInfo = {
+    uid: '',
+    username: '',
+    avatar: '',
+  };
+
+  appOptions: { name: string; token: string }[] = [];
+  selectedApps: string[] = [];
+  menuItems: any[] = [];
+
+  private destroy$ = new Subject<void>();
+  private updateChannel!: BroadcastChannel;
+  private logoutChannel!: BroadcastChannel;
+
   constructor(
-    private appContext: ApplicationContextService,
-    private router: Router
+    private tokenService: TokenService,
+    private sharedService: SharedService,
+    private router: Router,
+    private appMonitor: ApplicationMonitorService,
+    private messageService: MessageService,
+    public appSelection: AppSelectionService,
+    private menuService: MenuService,
+    private sidebarState: SidebarStateService,
+    private darkModeService: DarkModeService,
+    private appContext: ApplicationContextService
   ) {}
 
-  canActivate(
-    route: ActivatedRouteSnapshot
-  ): Observable<boolean | UrlTree> {
-    // 🔑 Si contexte pas chargé, le charger
-    if (!this.appContext.isContextReady()) {
-      return this.appContext.initializeContext().pipe(
-        switchMap(() => this.checkAuth(route)),
-        catchError(() => {
-          console.error('Failed to initialize context');
-          return [this.router.parseUrl('/access-control')];
-        })
-      );
-    }
+  ngOnInit() {
+    this.initializeDarkMode();
+    this.initializeUserInfo();
+    this.initializeAppSelection();
+    this.initializeMenu();
+    this.setupTabSync();
+    this.setupLogoutSync();
+    this.setupAppMonitoring();
 
-    // ✅ Contexte déjà chargé, vérifier l'accès
-    return this.checkAuth(route);
-  }
+    this.checkScreenSize();
+    this.resizeSubscription = fromEvent(window, 'resize')
+      .pipe(debounceTime(300))
+      .subscribe(() => this.checkScreenSize());
+    this.sidebarState.setCollapsed(this.isSidebarCollapsed);
 
-  private checkAuth(route: ActivatedRouteSnapshot): Observable<boolean | UrlTree> {
-    return new Observable(observer => {
-      const context = this.appContext.currentContext;
-
-      // ❌ Pas de contexte ou session expirée
-      if (!context || this.appContext.isSessionExpired()) {
-        console.warn('No context or session expired');
-        observer.next(this.router.parseUrl('/access-control'));
-        observer.complete();
-        return;
-      }
-
-      const accessibleApps = context.accessibleApps?.map((a: any) => a.name) ?? [];
-
-      // ❌ Pas d'apps accessibles
-      if (!accessibleApps || accessibleApps.length === 0) {
-        console.warn('No accessible apps');
-        observer.next(this.router.parseUrl('/access-control'));
-        observer.complete();
-        return;
-      }
-
-      const isAdmin = accessibleApps.some(app => app.toLowerCase() === 'admin');
-      const hasOtherApps = accessibleApps.length > 1;
-
-      // 🔴 Logique: admin + autres apps → rediriger vers /admin/settings
-      if (isAdmin && hasOtherApps) {
-        const currentRoute = route.routeConfig?.path;
-        if (currentRoute !== 'admin/settings') {
-          console.warn('Admin with other apps: redirecting to admin/settings');
-          observer.next(this.router.parseUrl('/admin/settings'));
-          observer.complete();
-          return;
-        }
-      }
-
-      // ✅ Vérifier l'accès à une app spécifique
-      const appName = route.params['appName'];
-      if (appName) {
-        const hasAccess = accessibleApps.some(
-          app => app.toLowerCase() === appName.toLowerCase()
-        );
-        if (!hasAccess) {
-          console.warn(`No access to app: ${appName}`);
-          observer.next(this.router.parseUrl('/access-control'));
-          observer.complete();
-          return;
-        }
-      }
-
-      // ✅ Tous les contrôles passent
-      observer.next(true);
-      observer.complete();
+    this.darkModeService.isDarkMode$.pipe(
+      takeUntil(this.destroy$)
+    ).subscribe(isDark => {
+      this.isDarkMode = isDark;
+      this.initializeMenu();
     });
   }
-}
 
-// =========================================
-// SSO GUARD (MINIMAL)
-// =========================================
+  checkScreenSize() {
+    this.isMobile = window.innerWidth <= 992;
+    this.isMobileOpen = false;
+  }
 
-import { Injectable } from '@angular/core';
-import { CanActivate, ActivatedRouteSnapshot, Router, UrlTree } from '@angular/router';
-import { OAuthService } from 'angular-oauth2-oidc';
+  private initializeUserInfo(): void {
+    this.sharedService.userInfo$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(data => {
+        this.userInfo = {
+          uid: data.uid || '',
+          username: data.username || 'User',
+          avatar: data.avatar || '',
+        };
+      });
+  }
 
-@Injectable({ providedIn: 'root' })
-export class sSOGuard implements CanActivate {
-  constructor(
-    private oauthService: OAuthService,
-    private router: Router
-  ) {}
+  private initializeAppSelection(): void {
+    const savedSelection = localStorage.getItem(this.appSelection.localStorageKey);
+    this.updateAppOptions();
+    this.appSelection.initializeWithAppOptions();
 
-  canActivate(): boolean | UrlTree {
-    if (this.oauthService.hasValidAccessToken()) {
-      return true;
+    this.appSelection.initializeSelection(savedSelection);
+
+    this.appSelection.selection$
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(selection => {
+        this.selectedApps = selection;
+        this.emitSelectedAppIds();
+      });
+
+    this.tokenService.tokenUpdates
+      .pipe(takeUntil(this.destroy$))
+      .subscribe(() => {
+        this.updateAppOptions();
+      });
+  }
+
+  private emitSelectedAppIds(): void {
+    this.selectedAppIdsChange.emit(this.appSelection.getDecodedAppIds());
+  }
+
+  onAppSelectionChange(event: any): void {
+    this.appSelection.updateSelection(event.value);
+  }
+
+  hasAvailableApps(): boolean {
+    return this.appSelection.currentAppOptions.length > 0;
+  }
+
+  private updateAppOptions(): void {
+    const appData = this.tokenService.getAppNames();
+    this.appOptions = appData.map(app => ({
+      name: app.name || 'Unknown',
+      token: app.token || ''
+    }));
+    this.appOptionsLoaded.emit(this.appOptions);
+  }
+
+  private setupTabSync(): void {
+    this.updateChannel = new BroadcastChannel('app-updates');
+    this.updateChannel.onmessage = (event) => {
+      if (event.data.type === 'self-update') {
+        this.tokenService.markSelfUpdate(event.data.appId);
+        setTimeout(() => window.location.reload(), 1000);
+      }
+    };
+  }
+
+  // 🔑 Écouter les logouts des autres fenêtres
+  private setupLogoutSync(): void {
+    try {
+      this.logoutChannel = new BroadcastChannel('auth-logout');
+      this.logoutChannel.onmessage = (event) => {
+        if (event.data.type === 'logout-triggered') {
+          console.log('Logout detected from another window in navbar');
+          // Une autre fenêtre a fait logout, faire le même localement
+          this.handleRemoteLogout();
+        }
+      };
+    } catch (e) {
+      console.warn('BroadcastChannel for logout not supported:', e);
     }
-    return this.router.parseUrl('/auth');
+  }
+
+  // 🧹 Nettoyer à la détection d'un logout distant
+  private handleRemoteLogout(): void {
+    this.tokenService.logout();
+    this.router.navigate(['/access-control']);
+  }
+
+  private setupAppMonitoring(): void {
+    this.appSelection.getDecodedAppIds().forEach(appId => {
+      this.appMonitor.listenForAppChange(appId)
+        .pipe(takeUntil(this.destroy$))
+        .subscribe(() => this.handleAppChange(appId));
+    });
+  }
+
+  private handleAppChange(appId: string): void {
+    if (this.tokenService.shouldIgnoreUpdate(appId)) return;
+
+    this.messageService.add({
+      severity: 'error',
+      summary: 'App Changed',
+      detail: 'This application was updated. You have been disconnected to ensure consistency.',
+      key: 'app-change-toast',
+      life: 6000
+    });
+
+    setTimeout(() => this.logout(), 5000);
+  }
+
+  ngOnDestroy(): void {
+    if (this.resizeSubscription) {
+      this.resizeSubscription.unsubscribe();
+    }
+    if (this.logoutChannel) {
+      this.logoutChannel.close();
+    }
+    this.destroy$.next();
+    this.destroy$.complete();
+  }
+
+  // ✅ Logout appelé localement
+  logout(): void {
+    this.appContext.logout().subscribe({
+      next: () => {
+        console.log('Logout successful from navbar');
+        // Notifier les autres fenêtres
+        try {
+          this.logoutChannel.postMessage({
+            type: 'logout-triggered',
+          });
+        } catch (e) {
+          console.warn('Failed to broadcast logout from navbar:', e);
+        }
+        this.tokenService.logout();
+        this.router.navigate(['/access-control']);
+      },
+      error: (err) => {
+        console.error('Logout failed:', err);
+        this.tokenService.logout();
+        this.router.navigate(['/access-control']);
+      }
+    });
+  }
+
+  navigateToAdminPanel(): void {
+    this.router.navigate(['/admin/settings']);
+  }
+
+  onToggleSidebar() {
+    if (this.isMobile) {
+      this.isMobileOpen = !this.isMobileOpen;
+      this.sidebarState.setMobileOpen(this.isMobileOpen);
+      this.isSidebarCollapsed = false;
+    } else {
+      this.isSidebarCollapsed = !this.isSidebarCollapsed;
+      this.sidebarState.setCollapsed(this.isSidebarCollapsed);
+    }
+  }
+
+  onCreateForm() {
+    this.createForm.emit();
+  }
+
+  onMenuItemSelected(status: string) {
+    this.menuItemSelected.emit(status);
+  }
+
+  onAdminTabSelected(tabId: string) {
+    this.adminTabSelected.emit(tabId);
+  }
+
+  toggleDarkMode(): void {
+    this.darkModeService.toggleDarkMode();
+  }
+
+  private initializeMenu(): void {
+    const menuConfig: MenuConfig = {
+      isDarkMode: this.isDarkMode,
+      toggleDarkMode: () => this.toggleDarkMode(),
+      navigateToAdmin: () => this.navigateToAdminPanel()
+    };
+
+    this.menuItems = this.menuService.getMainMenu(menuConfig);
+  }
+
+  private initializeDarkMode(): void {
+    this.isDarkMode = this.darkModeService.getCurrentMode();
   }
 }
