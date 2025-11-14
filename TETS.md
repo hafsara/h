@@ -1,10 +1,10 @@
 // =========================================
-// 1️⃣ APPLICATION CONTEXT SERVICE (CORRIGÉ)
+// APPLICATION CONTEXT SERVICE
 // =========================================
 
 import { Injectable } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { BehaviorSubject, Observable, interval, firstValueFrom } from 'rxjs';
+import { BehaviorSubject, Observable, interval } from 'rxjs';
 import { tap, catchError, switchMap } from 'rxjs/operators';
 import { environment } from '../../environments/environment';
 
@@ -24,48 +24,103 @@ export class ApplicationContextService {
   private contextSubject = new BehaviorSubject<AppContext | null>(null);
   public context$ = this.contextSubject.asObservable();
 
-  private loadingSubject = new BehaviorSubject<boolean>(true);
+  private loadingSubject = new BehaviorSubject<boolean>(false);
   public loading$ = this.loadingSubject.asObservable();
 
   private apiBaseUrl = `${environment.apiUrl}/sessions`;
   private refreshTimerStarted = false;
+  private channel: BroadcastChannel;
+  private isInitializing = false;
 
   constructor(private http: HttpClient) {
-    // ✅ Charger le contexte UNE SEULE FOIS au démarrage
-    this.initializeContext();
+    this.setupBroadcastChannel();
+    // NE PAS charger ici, attendre le guard
   }
 
-  // 🔑 Initialiser le contexte (appelé une fois au démarrage)
-  private initializeContext(): void {
-    this.loadContext().subscribe({
-      next: (context) => {
+  // 🔑 Setup BroadcastChannel pour synchroniser entre fenêtres
+  private setupBroadcastChannel(): void {
+    try {
+      this.channel = new BroadcastChannel('app-context');
+      this.channel.onmessage = (event) => {
+        if (event.data.type === 'context-updated') {
+          // Une autre fenêtre a mis à jour le contexte
+          this.contextSubject.next(event.data.context);
+          console.log('Context synced from another window:', event.data.context);
+        } else if (event.data.type === 'context-logout') {
+          // Une autre fenêtre s'est logout
+          this.contextSubject.next(null);
+          this.refreshTimerStarted = false;
+          console.log('Context cleared from logout in another window');
+        }
+      };
+    } catch (e) {
+      console.warn('BroadcastChannel not supported:', e);
+    }
+  }
+
+  // 📡 Fonction PUBLIQUE : initialiser le contexte (à appeler du guard)
+  initializeContext(): Observable<AppContext> {
+    // ✅ Si déjà en cours d'initialisation, ne pas refaire
+    if (this.isInitializing) {
+      console.warn('Context initialization already in progress');
+      return this.context$;
+    }
+
+    // ✅ Si contexte déjà présent, retourner directement
+    if (this.contextSubject.value !== null) {
+      console.log('Context already loaded');
+      return this.context$;
+    }
+
+    this.isInitializing = true;
+    this.loadingSubject.next(true);
+
+    return this.loadContext().pipe(
+      tap(context => {
         this.contextSubject.next(context);
         this.loadingSubject.next(false);
+        this.isInitializing = false;
+
+        // 📢 Notifier les autres fenêtres
+        this.broadcastContextUpdate(context);
+
         // Démarrer le refresh timer APRÈS le premier chargement
         this.startRefreshTimer();
-      },
-      error: (err) => {
+      }),
+      catchError(err => {
         console.error('Failed to load context:', err);
         this.loadingSubject.next(false);
-        // Même en erreur, démarrer le timer (pour retry)
-        this.startRefreshTimer();
-      },
-    });
+        this.isInitializing = false;
+        throw err;
+      })
+    );
   }
 
-  // 📡 Charger le contexte depuis l'API
+  // 🔄 Charger le contexte depuis l'API
   private loadContext(): Observable<AppContext> {
     return this.http.get<AppContext>(`${this.apiBaseUrl}`, {
       withCredentials: true,
     }).pipe(
       tap(context => {
-        console.log('Context loaded:', context);
+        console.log('Context loaded from API:', context);
       }),
       catchError(error => {
-        console.error('Failed to load context:', error);
+        console.error('Failed to load context from API:', error);
         throw error;
       })
     );
+  }
+
+  // 📢 Envoyer le contexte aux autres fenêtres via BroadcastChannel
+  private broadcastContextUpdate(context: AppContext): void {
+    try {
+      this.channel.postMessage({
+        type: 'context-updated',
+        context: context,
+      });
+    } catch (e) {
+      console.warn('Failed to broadcast context update:', e);
+    }
   }
 
   // 🔄 Démarrer le timer de refresh (toutes les 30 min)
@@ -96,7 +151,6 @@ export class ApplicationContextService {
 
   get accessibleApps(): Array<{ name: string; id?: string }> {
     const apps = this.contextSubject.value?.accessibleApps ?? [];
-    // Filtrer les apps admin
     return apps.filter(app => app.name.toLowerCase() !== 'admin');
   }
 
@@ -119,6 +173,7 @@ export class ApplicationContextService {
     }).pipe(
       tap(context => {
         this.contextSubject.next(context);
+        this.broadcastContextUpdate(context);
       }),
       catchError(error => {
         console.error('Session refresh failed:', error);
@@ -134,6 +189,15 @@ export class ApplicationContextService {
       tap(() => {
         this.contextSubject.next(null);
         this.refreshTimerStarted = false;
+
+        // 📢 Notifier les autres fenêtres du logout
+        try {
+          this.channel.postMessage({
+            type: 'context-logout',
+          });
+        } catch (e) {
+          console.warn('Failed to broadcast logout:', e);
+        }
       })
     );
   }
@@ -144,6 +208,7 @@ export class ApplicationContextService {
     }).pipe(
       tap(context => {
         this.contextSubject.next(context);
+        this.broadcastContextUpdate(context);
         this.startRefreshTimer();
       }),
       catchError(error => {
@@ -165,27 +230,15 @@ export class ApplicationContextService {
     return this.contextSubject.value !== null;
   }
 
-  // Attendre que le contexte soit chargé (utile pour les guards)
-  waitForContext(): Promise<AppContext | null> {
-    return new Promise((resolve) => {
-      const subscription = this.context$.subscribe(context => {
-        if (context !== null) {
-          subscription.unsubscribe();
-          resolve(context);
-        }
-      });
-
-      // Timeout après 5 secondes
-      setTimeout(() => {
-        subscription.unsubscribe();
-        resolve(this.currentContext);
-      }, 5000);
-    });
+  ngOnDestroy(): void {
+    if (this.channel) {
+      this.channel.close();
+    }
   }
 }
 
 // =========================================
-// 2️⃣ AUTH GUARD (CORRIGÉ & OPTIMISÉ)
+// AUTH GUARD (UTILISE initializeContext())
 // =========================================
 
 import { Injectable } from '@angular/core';
@@ -195,8 +248,8 @@ import {
   Router,
   UrlTree,
 } from '@angular/router';
-import { Observable, of } from 'rxjs';
-import { switchMap, take } from 'rxjs/operators';
+import { Observable } from 'rxjs';
+import { tap, catchError, switchMap } from 'rxjs/operators';
 import { ApplicationContextService } from '../services/application-context.service';
 
 @Injectable({ providedIn: 'root' })
@@ -208,65 +261,85 @@ export class AuthGuard implements CanActivate {
 
   canActivate(
     route: ActivatedRouteSnapshot
-  ): boolean | UrlTree | Observable<boolean | UrlTree> | Promise<boolean | UrlTree> {
-    // 🔑 Attendre que le contexte soit chargé
+  ): Observable<boolean | UrlTree> {
+    // 🔑 Si contexte pas chargé, le charger
+    if (!this.appContext.isContextReady()) {
+      return this.appContext.initializeContext().pipe(
+        switchMap(() => this.checkAuth(route)),
+        catchError(() => {
+          console.error('Failed to initialize context');
+          return [this.router.parseUrl('/access-control')];
+        })
+      );
+    }
+
+    // ✅ Contexte déjà chargé, vérifier l'accès
     return this.checkAuth(route);
   }
 
-  private async checkAuth(route: ActivatedRouteSnapshot): Promise<boolean | UrlTree> {
-    // Attendre que le contexte soit dispo
-    const context = await this.appContext.waitForContext();
+  private checkAuth(route: ActivatedRouteSnapshot): Observable<boolean | UrlTree> {
+    return new Observable(observer => {
+      const context = this.appContext.currentContext;
 
-    // ❌ Pas de contexte ou session expirée
-    if (!context || this.appContext.isSessionExpired()) {
-      console.warn('No context or session expired');
-      return this.router.parseUrl('/access-control');
-    }
-
-    const accessibleApps = context.accessibleApps?.map((a: any) => a.name) ?? [];
-
-    // ❌ Pas d'apps accessibles
-    if (!accessibleApps || accessibleApps.length === 0) {
-      console.warn('No accessible apps');
-      return this.router.parseUrl('/access-control');
-    }
-
-    const isAdmin = accessibleApps.some(app => app.toLowerCase() === 'admin');
-    const hasOtherApps = accessibleApps.length > 1;
-
-    // 🔴 Logique spéciale: admin + autres apps → rediriger vers /admin/settings
-    if (isAdmin && hasOtherApps) {
-      const currentRoute = route.routeConfig?.path;
-      if (currentRoute !== 'admin/settings') {
-        console.warn('Admin with other apps: redirecting to admin/settings');
-        return this.router.parseUrl('/admin/settings');
+      // ❌ Pas de contexte ou session expirée
+      if (!context || this.appContext.isSessionExpired()) {
+        console.warn('No context or session expired');
+        observer.next(this.router.parseUrl('/access-control'));
+        observer.complete();
+        return;
       }
-    }
 
-    // ✅ Vérifier l'accès à une app spécifique si présente dans la route
-    const appName = route.params['appName'];
-    if (appName) {
-      const hasAccess = accessibleApps.some(
-        app => app.toLowerCase() === appName.toLowerCase()
-      );
-      if (!hasAccess) {
-        console.warn(`No access to app: ${appName}`);
-        return this.router.parseUrl('/access-control');
+      const accessibleApps = context.accessibleApps?.map((a: any) => a.name) ?? [];
+
+      // ❌ Pas d'apps accessibles
+      if (!accessibleApps || accessibleApps.length === 0) {
+        console.warn('No accessible apps');
+        observer.next(this.router.parseUrl('/access-control'));
+        observer.complete();
+        return;
       }
-    }
 
-    // ✅ Tous les contrôles passent
-    return true;
+      const isAdmin = accessibleApps.some(app => app.toLowerCase() === 'admin');
+      const hasOtherApps = accessibleApps.length > 1;
+
+      // 🔴 Logique: admin + autres apps → rediriger vers /admin/settings
+      if (isAdmin && hasOtherApps) {
+        const currentRoute = route.routeConfig?.path;
+        if (currentRoute !== 'admin/settings') {
+          console.warn('Admin with other apps: redirecting to admin/settings');
+          observer.next(this.router.parseUrl('/admin/settings'));
+          observer.complete();
+          return;
+        }
+      }
+
+      // ✅ Vérifier l'accès à une app spécifique
+      const appName = route.params['appName'];
+      if (appName) {
+        const hasAccess = accessibleApps.some(
+          app => app.toLowerCase() === appName.toLowerCase()
+        );
+        if (!hasAccess) {
+          console.warn(`No access to app: ${appName}`);
+          observer.next(this.router.parseUrl('/access-control'));
+          observer.complete();
+          return;
+        }
+      }
+
+      // ✅ Tous les contrôles passent
+      observer.next(true);
+      observer.complete();
+    });
   }
 }
 
 // =========================================
-// 3️⃣ SSO GUARD (EXEMPLE)
+// SSO GUARD (MINIMAL)
 // =========================================
 
 import { Injectable } from '@angular/core';
 import { CanActivate, ActivatedRouteSnapshot, Router, UrlTree } from '@angular/router';
-import { Observable } from 'rxjs';
 import { OAuthService } from 'angular-oauth2-oidc';
 
 @Injectable({ providedIn: 'root' })
@@ -276,71 +349,10 @@ export class sSOGuard implements CanActivate {
     private router: Router
   ) {}
 
-  canActivate(
-    route: ActivatedRouteSnapshot
-  ): boolean | UrlTree | Observable<boolean | UrlTree> | Promise<boolean | UrlTree> {
-    // Vérifier que l'utilisateur a un token valide
+  canActivate(): boolean | UrlTree {
     if (this.oauthService.hasValidAccessToken()) {
       return true;
     }
-
-    // Sinon rediriger vers login
     return this.router.parseUrl('/auth');
   }
 }
-
-// =========================================
-// 4️⃣ APP.MODULE.TS (MINIMAL)
-// =========================================
-
-import { NgModule, APP_INITIALIZER } from '@angular/core';
-import { BrowserModule } from '@angular/platform-browser';
-import { HttpClientModule, HTTP_INTERCEPTORS } from '@angular/common/http';
-import { OAuthModule } from 'angular-oauth2-oidc';
-
-import { AppComponent } from './app.component';
-import { DarkModeService } from './services/navbar/dark-mode.service';
-import { AuthInitService } from './services/auth-init.service';
-import { AuthInterceptor } from './interceptors/auth.interceptor';
-import { AuthGuard } from './guards/auth.guard';
-import { sSOGuard } from './guards/sso.guard';
-
-export function initializeDarkMode(darkMode: DarkModeService) {
-  return () => darkMode.initializeOnStartup();
-}
-
-export function initializeAuth(authService: AuthInitService) {
-  return () => authService.initializeAuth();
-}
-
-@NgModule({
-  declarations: [AppComponent],
-  imports: [
-    BrowserModule,
-    HttpClientModule,
-    OAuthModule.forRoot(),
-  ],
-  providers: [
-    {
-      provide: APP_INITIALIZER,
-      useFactory: initializeDarkMode,
-      deps: [DarkModeService],
-      multi: true,
-    },
-    {
-      provide: APP_INITIALIZER,
-      useFactory: initializeAuth,
-      deps: [AuthInitService],
-      multi: true,
-    },
-    {
-      provide: HTTP_INTERCEPTORS,
-      useClass: AuthInterceptor,
-      multi: true,
-    },
-    AuthGuard,
-    sSOGuard,
-  ],
-  bootstrap: [AppComponent],
-})
-export class AppModule {}
