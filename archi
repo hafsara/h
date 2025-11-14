@@ -1,0 +1,250 @@
+// =========================================
+// AUTH GUARD (ADAPTÉ)
+// =========================================
+
+import { Injectable } from '@angular/core';
+import {
+  CanActivate,
+  ActivatedRouteSnapshot,
+  Router,
+  UrlTree
+} from '@angular/router';
+import { Observable, of, firstValueFrom } from 'rxjs';
+import { switchMap, take, timeout } from 'rxjs/operators';
+import { ApplicationContextService } from '../services/application-context.service';
+import { TokenService } from '../services/token.service';
+
+@Injectable({ providedIn: 'root' })
+export class AuthGuard implements CanActivate {
+  // 🔑 Flag pour signaler que l'initialisation est terminée
+  private authInitialized = false;
+  private initPromise: Promise<void> | null = null;
+
+  constructor(
+    private appContext: ApplicationContextService,
+    private tokenService: TokenService,
+    private router: Router
+  ) {
+    this.initializeAuthOnce();
+  }
+
+  // 🔑 S'exécute une seule fois, au démarrage du guard
+  private initializeAuthOnce(): void {
+    if (this.authInitialized || this.initPromise) {
+      return;
+    }
+
+    // Lancer l'initialisation en parallèle
+    this.initPromise = new Promise(async (resolve) => {
+      try {
+        // Essayer de charger le contexte
+        await firstValueFrom(
+          this.appContext.loadContext().pipe(timeout(5000)) // Timeout 5s
+        );
+        this.authInitialized = true;
+      } catch (error) {
+        console.warn('Auth initialization failed, but continuing:', error);
+        this.authInitialized = true; // Même en erreur, on continue
+      }
+      resolve();
+    });
+  }
+
+  canActivate(route: ActivatedRouteSnapshot): Observable<boolean | UrlTree> {
+    return new Observable(observer => {
+      // Attendre que l'initialisation soit faite
+      this.waitForInitialization().then(() => {
+        const result = this.checkAccess();
+        observer.next(result);
+        observer.complete();
+      });
+    });
+  }
+
+  // Attendre que l'auth soit prête
+  private async waitForInitialization(): Promise<void> {
+    if (this.authInitialized) {
+      return;
+    }
+    await this.initPromise;
+  }
+
+  // Vérifications d'accès
+  private checkAccess(): boolean | UrlTree {
+    // ✅ Vérifier que le token existe
+    if (!this.tokenService.isBrowser()) {
+      console.warn('Not in browser context');
+      return this.router.parseUrl('/access-control');
+    }
+
+    // ✅ Vérifier que le contexte existe
+    const context = this.appContext.currentContext;
+    if (!context) {
+      console.warn('No context available');
+      return this.router.parseUrl('/access-control');
+    }
+
+    // ✅ Vérifier que la session n'est pas expirée
+    if (this.appContext.isSessionExpired()) {
+      console.warn('Session expired');
+      return this.router.parseUrl('/access-control');
+    }
+
+    // ✅ Tous les contrôles passent
+    return true;
+  }
+}
+
+// =========================================
+// APP.MODULE.TS (AVEC INITIALISATION)
+// =========================================
+
+import { NgModule, APP_INITIALIZER } from '@angular/core';
+import { BrowserModule } from '@angular/platform-browser';
+import { HttpClientModule, HTTP_INTERCEPTORS } from '@angular/common/http';
+import { OAuthModule } from 'angular-oauth2-oidc';
+
+import { AppComponent } from './app.component';
+import { DarkModeService } from './services/navbar/dark-mode.service';
+import { AuthInitService } from './services/auth-init.service';
+import { ApplicationContextService } from './services/application-context.service';
+import { AuthInterceptor } from './interceptors/auth.interceptor';
+import { AuthGuard } from './guards/auth.guard';
+import { sSOGuard } from './guards/sso.guard';
+
+// Factory functions pour APP_INITIALIZER
+export function initializeDarkMode(darkMode: DarkModeService) {
+  return () => darkMode.initializeOnStartup();
+}
+
+export function initializeAuth(authService: AuthInitService) {
+  return () => authService.initializeAuth();
+}
+
+@NgModule({
+  declarations: [AppComponent],
+  imports: [
+    BrowserModule,
+    HttpClientModule,
+    OAuthModule.forRoot(),
+  ],
+  providers: [
+    // 🔴 ORDRE CRITIQUE
+    // 1. DarkMode (UI)
+    {
+      provide: APP_INITIALIZER,
+      useFactory: initializeDarkMode,
+      deps: [DarkModeService],
+      multi: true,
+    },
+    // 2. Auth OIDC
+    {
+      provide: APP_INITIALIZER,
+      useFactory: initializeAuth,
+      deps: [AuthInitService],
+      multi: true,
+    },
+    // Interceptor HTTP
+    {
+      provide: HTTP_INTERCEPTORS,
+      useClass: AuthInterceptor,
+      multi: true,
+    },
+    // Guards
+    AuthGuard,
+    sSOGuard,
+  ],
+  bootstrap: [AppComponent],
+})
+export class AppModule {}
+
+// =========================================
+// APPLICATION CONTEXT SERVICE (LÉGER)
+// =========================================
+// ⚠️ GARDER INTACT, juste vérifier que:
+// 1. loadContext() est utilisable en dehors du constructor
+// 2. Pas d'appel automatique dans constructor
+
+// À modifier dans ton ApplicationContextService:
+
+export class ApplicationContextService {
+  // ... (tout le reste inchangé)
+
+  constructor(private http: HttpClient) {
+    // ❌ ENLEVER ceci :
+    // this.loadContext();
+
+    // ❌ ENLEVER ceci aussi:
+    // interval(30 * 60 * 1000).pipe(...)
+  }
+
+  // ✅ Garder loadContext() publique
+  loadContext(): Observable<AppContext> {
+    this.loadingSubject.next(true);
+    return this.http.get<AppContext>('/api/session/context').pipe(
+      tap(context => {
+        this.contextSubject.next(context);
+        this.loadingSubject.next(false);
+
+        // 🔑 Démarrer le refresh APRÈS le premier loadContext
+        if (!this.refreshTimerStarted) {
+          this.startSessionRefreshTimer();
+          this.refreshTimerStarted = true;
+        }
+      }),
+      catchError(error => {
+        console.error('Failed to load context:', error);
+        this.loadingSubject.next(false);
+        throw error;
+      })
+    );
+  }
+
+  private refreshTimerStarted = false;
+
+  private startSessionRefreshTimer(): void {
+    interval(30 * 60 * 1000)
+      .pipe(
+        switchMap(() => this.refreshSession()),
+        catchError(err => {
+          console.error('Session refresh failed:', err);
+          return [];
+        })
+      )
+      .subscribe();
+  }
+
+  // ... (reste inchangé)
+}
+
+// =========================================
+// ROUTING (INCHANGÉ)
+// =========================================
+
+const routes: Routes = [
+  { path: 'admin', component: WorkflowBuilderComponent},
+  { path: 'access-control', component: AccessControlComponent},
+  { path: 'auth', component: AuthComponent },
+  { path: 'dashboard', component: DashboardComponent, canActivate: [sSOGuard, AuthGuard] },
+  { path: 'create-form', component: DashboardComponent, canActivate: [sSOGuard, AuthGuard] },
+  { path: 'dashboard/:appName/load-form/:access_token', component: DashboardComponent, canActivate: [sSOGuard, AuthGuard] },
+  { path: 'form-view/:access_token', component: FormViewComponent, canActivate: [sSOGuard] },
+  { path: 'my-forms', component: MyFormsComponent, canActivate: [sSOGuard] },
+  { path: 'admin/settings', component: AdminPanelComponent, canActivate: [sSOGuard, AuthGuard] },
+  { path: '404', component: PageNotFoundComponent },
+  { path: '', redirectTo: '/dashboard', pathMatch: 'full' },
+  { path: '**', redirectTo: '404' },
+];
+
+@NgModule({
+  imports: [RouterModule.forRoot(routes)],
+  exports: [RouterModule]
+})
+export class AppRoutingModule { }┌────────────────────────────┐     ┌────────────────────────────┐
+│       Server1              │     │       Server2              │
+│ IP: 192.168.1.10           │     │ IP: 192.168.1.11           │
+│ Hostname: rabbit1          │     │ Hostname: rabbit2          │
+│ Role: Master + Worker      │     │ Role: Mirror + Worker      │
+└────────────────────────────┘     └────────────────────────────┘
+
+
